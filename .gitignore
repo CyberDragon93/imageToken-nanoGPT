@@ -66,5 +66,4 @@ dmypy.json
 
 # nanoGPT specific
 out/
-data/
 wandb/
