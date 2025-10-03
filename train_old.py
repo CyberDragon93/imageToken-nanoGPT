@@ -31,20 +31,16 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 
-import glob
-from PIL import Image
-from torchvision import transforms
-
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from model_tokenfree import GPTConfig, GPT
+from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = '/scratch/10992/liaorunlong93/logs/nanoGPT-flow/chinese-image'
+out_dir = '/scratch/10992/liaorunlong93/logs/nanoGPT-flow/chinese-baseline'
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -56,8 +52,8 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'chinese_char'
-batch_size = 128 # micro-batch size per *optimizer step loop*, before GAS
-gradient_accumulation_steps = 2  # intended global GAS; will be adjusted by world_size below
+batch_size = 192 # micro-batch size per *optimizer step loop*, before GAS
+gradient_accumulation_steps = 1  # intended global GAS; will be adjusted by world_size below
 eval_interval = 2000 // gradient_accumulation_steps
 block_size = 1024
 # model
@@ -138,47 +134,6 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 # ------------------------- Data -------------------------
 data_dir = os.path.join('data', dataset)
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None # will be set by image loading or meta.pkl
-
-# Helper function to pre-load all images from a directory
-def load_images(image_folder_path):
-    """Loads all .png grayscale images from a folder, sorts them, and returns a stacked tensor [N, 1, H, W]."""
-    image_files = sorted(glob.glob(os.path.join(image_folder_path, '*.png')))
-    if not image_files:
-        raise FileNotFoundError(f"No PNG images found in {image_folder_path}")
-
-    # 转成单通道灰度并变成 [1, H, W]，像素范围 [0,1]
-    transform = transforms.Compose([
-        transforms.Grayscale(num_output_channels=1),  # 统一单通道
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
-    ])
-
-    image_tensors = []
-    print(f"Loading images from {image_folder_path}...")
-    for img_path in image_files:
-        with Image.open(img_path) as img:
-            # 无论原始是 L / LA / RGB / RGBA，都统一转为单通道
-            img = img.convert('L')
-            image_tensors.append(transform(img))
-    print(f"Loaded {len(image_tensors)} images.")
-    return torch.stack(image_tensors)  # [N, 1, H, W]
-
-
-# Load image dataset if specified, and update vocab size accordingly
-image_dataset = None
-if dataset == 'chinese_char':
-    image_data_path = os.path.join(data_dir, 'images')
-    if os.path.isdir(image_data_path):
-        image_dataset = load_images(image_data_path)  # 现在是 [N, 1, H, W]
-        meta_vocab_size = len(image_dataset)
-        if accelerator.is_main_process:
-            print(f"Dataset '{dataset}' detected. Vocab size set to {meta_vocab_size} images.")
-    else:
-        if accelerator.is_main_process:
-            print(f"Warning: dataset is '{dataset}' but image directory not found at {image_data_path}")
-
 def get_batch(split):
     # Same "poor man's dataloader" with memmap, keeping RAM usage predictable.
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -188,19 +143,11 @@ def get_batch(split):
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x_ids = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y_ids = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    
-    if image_dataset is not None:
-        x = image_dataset[x_ids]
-        y = y_ids
-    else:
-        # Otherwise, retain the original behavior (use IDs as data)
-        x, y = x_ids, y_ids
-    
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.contiguous().pin_memory().to(device, non_blocking=True), y.contiguous().pin_memory().to(device, non_blocking=True)
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
     return x, y
