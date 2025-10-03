@@ -92,59 +92,78 @@ class MLP(nn.Module):
         return x
     
 
-class ResidualMLP(nn.Module):
-    def __init__(self, dim, inner_mult=2.0, dropout=0.0):
+class ResidualBottleneckMLP(nn.Module):
+    def __init__(self, emb_dim, r=4, dropout=0.0):
         super().__init__()
-        inner = int(dim * inner_mult)
-        self.norm = nn.LayerNorm(dim)
-        self.ff = nn.Sequential(
-            nn.Linear(dim, inner),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(inner, dim),
-        )
-        nn.init.zeros_(self.ff[-1].weight)
-        nn.init.zeros_(self.ff[-1].bias)
+        hid = max(emb_dim // r, 1)
+        self.norm = nn.LayerNorm(emb_dim)
+        self.fc1  = nn.Linear(emb_dim, hid)
+        self.fc2  = nn.Linear(hid, emb_dim)
+        self.drop = nn.Dropout(dropout)
+
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
-        return x + self.ff(self.norm(x))
+        h = self.norm(x)
+        h = F.gelu(self.fc1(h))
+        h = self.drop(self.fc2(h))
+        return x + h
 
-def _init_weights(m):
-    if isinstance(m, nn.Conv2d):
-        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='gelu')
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.Linear):
-        nn.init.xavier_uniform_(m.weight)
-        nn.init.zeros_(m.bias)
-
-class VisionEncoderSmall(nn.Module):
-    def __init__(self, in_channels, emb_dim, hidden=256, dropout=0.0, head_mult=2.0):
+class DepthwiseSeparable(nn.Module):
+    def __init__(self, C_in, C_out, stride=1):
         super().__init__()
-        C = hidden
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, C, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(C),
-            nn.GELU(),
-            nn.Conv2d(C, C, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(C),
-            nn.GELU(),
-            nn.Conv2d(C, emb_dim, kernel_size=1, stride=1, padding=0, bias=True),
+        self.dw = nn.Conv2d(C_in, C_in, kernel_size=3, stride=stride, padding=1, groups=C_in, bias=False)
+        self.pw = nn.Conv2d(C_in, C_out, kernel_size=1, bias=False)
+        self.norm = nn.GroupNorm(1, C_out) 
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        x = self.dw(x)
+        x = self.pw(x)
+        x = self.norm(x)
+        return self.act(x)
+
+class VisionEncoderTiny(nn.Module):
+    def __init__(self, in_channels, emb_dim=256, stem_channels=160,  # C 从 256 降到 160/128
+                 use_dw_block=True, mlp_bottleneck_r=4, dropout=0.0):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.in_channels = in_channels
+
+        self.patch = nn.Sequential(
+            nn.Conv2d(in_channels, stem_channels, kernel_size=7, stride=4, padding=3, bias=False),
+            nn.GroupNorm(1, stem_channels),
             nn.GELU(),
         )
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.head = ResidualMLP(emb_dim, inner_mult=head_mult, dropout=dropout)
-        self.out_ln = nn.LayerNorm(emb_dim)
-        self.apply(_init_weights)
 
-    def forward(self, images):
-        if images.dim() != 4:
-            raise ValueError(f"VisionEncoder expects (B,C,H,W), got {tuple(images.shape)}")
-        x = self.stem(images)          # (B, emb_dim, h', w')
-        x = self.pool(x).flatten(1)    # (B, emb_dim)
-        x = self.head(x)               # 残差 MLP（pre-norm）
-        x = self.out_ln(x)             # 输出层再 LN，一般更稳
-        return x                       # (B, emb_dim)
+        self.block = DepthwiseSeparable(stem_channels, emb_dim, stride=2) if use_dw_block \
+                     else nn.Conv2d(stem_channels, emb_dim, kernel_size=1, bias=False)
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.head = ResidualBottleneckMLP(emb_dim, r=mlp_bottleneck_r, dropout=dropout)
+        self.out_ln = nn.LayerNorm(emb_dim)
+
+    @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
+    def _encode_flat(self, x):
+        x = self.patch(x)     # -> (N, stemC, H/4, W/4)
+        x = self.block(x)     # -> (N, emb,   H/8, W/8)  (若 use_dw_block)
+        x = self.pool(x).flatten(1)   # (N, emb)
+        x = self.head(x)
+        return x
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if images.dim() == 4:
+            x = self._encode_flat(images)
+            return self.out_ln(x)
+        elif images.dim() == 5:
+            B, T, C, H, W = images.shape
+            x = images.reshape(B * T, C, H, W)
+            x = self._encode_flat(x).reshape(B, T, self.emb_dim)
+            return self.out_ln(x)
+        else:
+            raise ValueError(f"Expected 4D or 5D, got {tuple(images.shape)}")
 
 
 class VisionEncoderFlattenMLPQiang(nn.Module):
@@ -205,12 +224,10 @@ class GPT(nn.Module):
         modules = {}
         self._vision_tokens = None
         if config.use_vision_encoder:
-            vision_encoder = VisionEncoderSmall(
+            vision_encoder = VisionEncoderTiny(
                 in_channels=config.in_channels,
                 emb_dim=config.n_embd,
-                hidden=256,
                 dropout=config.dropout,
-                head_mult=2.0,
             )
             modules['vte'] = vision_encoder
         else:
@@ -228,7 +245,8 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        if not config.use_vision_encoder:
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -263,9 +281,9 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         if self.config.use_vision_encoder:
             encoder = self.transformer.vte
-            if idx.dim() != 4:
-                raise ValueError(f"Vision GPT expects image tensors of shape (B, C, H, W), got {tuple(idx.shape)}")
-            weight = encoder.stem[0].weight
+            if idx.dim() != 5:
+                raise ValueError(f"Vision encoder expects inputs of shape (B, T, C, H, W), got {tuple(idx.shape)}")
+            weight = encoder.patch[0].weight
             idx = idx.to(device=weight.device, dtype=weight.dtype)
             tok_emb = encoder(idx) # (b, num_patches, n_embd)
         else:
@@ -282,7 +300,6 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:

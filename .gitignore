@@ -67,3 +67,5 @@ dmypy.json
 # nanoGPT specific
 out/
 wandb/
+/data/chinese_char
+/data/shakespeare_char
