@@ -51,9 +51,9 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True # disabled by default
+wandb_project = 'nanoGPT-flow'
+wandb_run_name = 'tokenizer-free-1' # 'run' + str(time.time())
 # data
 dataset = 'chinese_char'
 batch_size = 128 # micro-batch size per *optimizer step loop*, before GAS
@@ -334,38 +334,36 @@ while True:
         pg['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
+
     if iter_num % eval_interval == 0:
         # accelerator.wait_for_everyone()
         losses = estimate_loss()
-        if iter_num % eval_interval == 0:
-            # accelerator.wait_for_everyone()
-            losses = estimate_loss()
-            if accelerator.is_main_process:
-                print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-                if wandb_log:
-                    wandb.log({
-                        "iter": iter_num,
-                        "train/loss": losses['train'],
-                        "val/loss": losses['val'],
-                        "lr": lr,
-                        "mfu": running_mfu*100
-                    })
-                if (losses['val'] < best_val_loss) or always_save_checkpoint:
-                    best_val_loss = losses['val']
-                    if iter_num > 0:
-                        # unwrap to get clean state dict
-                        raw_state = accelerator.get_state_dict(model)
-                        checkpoint = {
-                            'model': raw_state,
-                            'optimizer': optimizer.state_dict(),
-                            'model_args': model_args,
-                            'iter_num': iter_num,
-                            'best_val_loss': best_val_loss,
-                            'config': config,
-                        }
-                        save_path = os.path.join(out_dir, 'ckpt.pt')
-                        accelerator.save(checkpoint, save_path)
-                        print(f"saving checkpoint to {save_path}")
+        if accelerator.is_main_process:
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100
+                })
+            if (losses['val'] < best_val_loss) or always_save_checkpoint:
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    # unwrap to get clean state dict
+                    raw_state = accelerator.get_state_dict(model)
+                    checkpoint = {
+                        'model': raw_state,
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    save_path = os.path.join(out_dir, 'ckpt.pt')
+                    accelerator.save(checkpoint, save_path)
+                    print(f"saving checkpoint to {save_path}")
         # accelerator.wait_for_everyone()
     if iter_num == 0 and eval_only:
         break
