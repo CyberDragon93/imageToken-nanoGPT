@@ -40,8 +40,7 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = '$SCRATCH/logs/nanoGPT-flow/out'
-eval_interval = 2000
+out_dir = '/scratch/10992/liaorunlong93/logs/nanoGPT-flow/chinese-baseline'
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -52,9 +51,10 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'shakespeare_char'
+dataset = 'chinese_char'
+batch_size = 192 # micro-batch size per *optimizer step loop*, before GAS
 gradient_accumulation_steps = 1  # intended global GAS; will be adjusted by world_size below
-batch_size = 128 # micro-batch size per *optimizer step loop*, before GAS
+eval_interval = 2000 // gradient_accumulation_steps
 block_size = 1024
 # model
 n_layer = 12
@@ -71,8 +71,8 @@ beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+warmup_iters = 2000 // gradient_accumulation_steps # how many steps to warm up for
+lr_decay_iters = 600000 // gradient_accumulation_steps # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # accelerate + compile settings
 mixed_precision = 'auto'  # 'auto' -> bf16 if supported else fp16; or explicitly 'bf16'/'fp16'/'no'
@@ -282,10 +282,10 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0:
-        accelerator.wait_for_everyone()
+        # accelerator.wait_for_everyone()
         losses = estimate_loss()
         if iter_num % eval_interval == 0:
-            accelerator.wait_for_everyone()
+            # accelerator.wait_for_everyone()
             losses = estimate_loss()
             if accelerator.is_main_process:
                 print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -313,7 +313,7 @@ while True:
                         save_path = os.path.join(out_dir, 'ckpt.pt')
                         accelerator.save(checkpoint, save_path)
                         print(f"saving checkpoint to {save_path}")
-        accelerator.wait_for_everyone()
+        # accelerator.wait_for_everyone()
     if iter_num == 0 and eval_only:
         break
 
