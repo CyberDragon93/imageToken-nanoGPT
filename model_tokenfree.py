@@ -90,6 +90,81 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
+    
+
+class ResidualMLP(nn.Module):
+    def __init__(self, dim, inner_mult=2.0, dropout=0.0):
+        super().__init__()
+        inner = int(dim * inner_mult)
+        self.norm = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, inner),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(inner, dim),
+        )
+        nn.init.zeros_(self.ff[-1].weight)
+        nn.init.zeros_(self.ff[-1].bias)
+
+    def forward(self, x):
+        return x + self.ff(self.norm(x))
+
+def _init_weights(m):
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='gelu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        nn.init.zeros_(m.bias)
+
+class VisionEncoderSmall(nn.Module):
+    def __init__(self, in_channels, emb_dim, hidden=256, dropout=0.0, head_mult=2.0):
+        super().__init__()
+        C = hidden
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, C, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(C),
+            nn.GELU(),
+            nn.Conv2d(C, C, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(C),
+            nn.GELU(),
+            nn.Conv2d(C, emb_dim, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.GELU(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = ResidualMLP(emb_dim, inner_mult=head_mult, dropout=dropout)
+        self.out_ln = nn.LayerNorm(emb_dim)
+        self.apply(_init_weights)
+
+    def forward(self, images):
+        if images.dim() != 4:
+            raise ValueError(f"VisionEncoder expects (B,C,H,W), got {tuple(images.shape)}")
+        x = self.stem(images)          # (B, emb_dim, h', w')
+        x = self.pool(x).flatten(1)    # (B, emb_dim)
+        x = self.head(x)               # 残差 MLP（pre-norm）
+        x = self.out_ln(x)             # 输出层再 LN，一般更稳
+        return x                       # (B, emb_dim)
+
+
+class VisionEncoderFlattenMLPQiang(nn.Module):
+    """Embed images as a sequence of patch tokens compatible with GPT."""
+
+    def __init__(self, image_size, patch_size, in_channels, emb_dim, vocab_size):
+        super().__init__()
+        assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels * image_size * image_size, vocab_size),
+            nn.GELU(),
+            nn.Linear(vocab_size, emb_dim)
+        )
+
+    def forward(self, images):
+        if images.dim() != 4:
+            raise ValueError(f"VisionEncoder expects inputs of shape (B, C, H, W), got {tuple(images.shape)}")
+        x = self.mlp(images.reshape(images.shape[0], -1))
+        return x    
+
 
 class Block(nn.Module):
 
@@ -114,6 +189,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_vision_encoder: bool = True
+    image_size: int = 64
+    patch_size: int = 2
+    in_channels: int = 1
 
 class GPT(nn.Module):
 
@@ -123,13 +202,27 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+        modules = {}
+        self._vision_tokens = None
+        if config.use_vision_encoder:
+            vision_encoder = VisionEncoderSmall(
+                in_channels=config.in_channels,
+                emb_dim=config.n_embd,
+                hidden=256,
+                dropout=config.dropout,
+                head_mult=2.0,
+            )
+            modules['vte'] = vision_encoder
+        else:
+            modules['wte'] = nn.Embedding(config.vocab_size, config.n_embd)
+
+        modules.update(dict(
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        self.transformer = nn.ModuleDict(modules)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -168,9 +261,24 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+        if self.config.use_vision_encoder:
+            encoder = self.transformer.vte
+            if idx.dim() != 4:
+                raise ValueError(f"Vision GPT expects image tensors of shape (B, C, H, W), got {tuple(idx.shape)}")
+            weight = encoder.stem[0].weight
+            idx = idx.to(device=weight.device, dtype=weight.dtype)
+            tok_emb = encoder(idx) # (b, num_patches, n_embd)
+        else:
+            if idx.dim() != 2:
+                raise ValueError(f"GPT expects token indices of shape (B, T), got {tuple(idx.shape)}")
+            tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+
+        b, t, _ = tok_emb.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        if self._vision_tokens is not None and t != self._vision_tokens:
+            raise ValueError(f"Vision encoder produced {t} tokens, expected {self._vision_tokens}")
+        
+        device = tok_emb.device
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
