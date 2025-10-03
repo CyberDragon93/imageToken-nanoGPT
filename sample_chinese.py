@@ -1,96 +1,54 @@
 """
-Sample from a trained model
+Sample from a trained model (image->text autoregressive)
 """
 import os
+import glob
 import pickle
 from contextlib import nullcontext
+
 import torch
 import tiktoken
-from model import GPTConfig, GPT
-import transforms
 from PIL import Image
-import glob
+from torchvision import transforms
+
+from model_tokenfree import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
-init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
-max_new_tokens = 500 # number of tokens generated in each sample
-temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
+init_from = 'resume'  # 'resume' or a gpt2 variant (e.g. 'gpt2-xl')
+out_dir = 'out'       # ignored if init_from is not 'resume'
+start = "\n"          # or "FILE:prompt.txt"
+num_samples = 10
+max_new_tokens = 500
+temperature = 0.8
+top_k = 200
 seed = 1337
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
-exec(open('configurator.py').read()) # overrides from command line or config file
+device = 'cuda'
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+compile = False
+exec(open('configurator.py').read())  # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# model
-if init_from == 'resume':
-    # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
-
-model.eval()
-model.to(device)
-if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
-
-# look for the meta pickle in case it is available in the dataset folder
-load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
-    load_meta = os.path.exists(meta_path)
-if load_meta:
-    print(f"Loading meta from {meta_path}...")
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    # TODO want to make this more general to arbitrary encoder/decoder schemes
-    stoi, itos = meta['stoi'], meta['itos']
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
-else:
-    # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
-
-data_dir = os.path.join('data', 'chinese_char')
-image_data_path = os.path.join(data_dir, 'images')
-
+# ------------------------- helpers -------------------------
 def load_images(image_folder_path):
-    """Loads all .png grayscale images from a folder"""
+    """Loads all .png grayscale images as a bank tensor [V, 1, H, W]."""
     image_files = sorted(glob.glob(os.path.join(image_folder_path, '*.png')))
     if not image_files:
         raise FileNotFoundError(f"No PNG images found in {image_folder_path}")
-    
+
     transform = transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
+        transforms.Normalize(mean=[0.5], std=[0.5]),
     ])
-    
+
     image_tensors = []
     print(f"Loading images from {image_folder_path}...")
     for img_path in image_files:
@@ -98,47 +56,108 @@ def load_images(image_folder_path):
             img = img.convert('L')
             image_tensors.append(transform(img))
     print(f"Loaded {len(image_tensors)} images.")
-    return torch.stack(image_tensors)  # [N, 1, H, W]
+    return torch.stack(image_tensors)  # [V, 1, H, W]
 
-image_dataset = load_images(image_data_path)
+# ------------------------- model -------------------------
+if init_from == 'resume':
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    gptconf = GPTConfig(**checkpoint['model_args'])
+    model = GPT(gptconf)
+    state_dict = checkpoint['model']
+    unwanted_prefix = '_orig_mod.'
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+elif init_from.startswith('gpt2'):
+    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 
+model.eval()
+model.to(device)
+if compile:
+    model = torch.compile(model)
 
-# Prepare starting image
-if isinstance(start, str) and start.startswith('FILE:'):
-    # Load custom image
-    transform = transforms.Compose([
-        transforms.Grayscale(num_output_channels=1),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
-    ])
-    with Image.open(start[5:]) as img:
-        img = img.convert('L')
-        start_img = transform(img).unsqueeze(0)  # [1, 1, H, W]
+# ------------------------- tokenizer / meta -------------------------
+load_meta = False
+meta_path = None
+if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']:
+    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
+    load_meta = os.path.exists(meta_path)
+
+if load_meta:
+    print(f"Loading meta from {meta_path}...")
+    with open(meta_path, 'rb') as f:
+        meta = pickle.load(f)
+    stoi, itos = meta['stoi'], meta['itos']
+    encode = lambda s: [stoi[c] for c in s]
+    decode = lambda l: ''.join([itos[i] for i in l])
 else:
-    # Use image from dataset by index
-    start_img = image_dataset[start:start+1]  # [1, 1, H, W]
+    print("No meta.pkl found, assuming GPT-2 encodings (text-only fallback)...")
+    enc = tiktoken.get_encoding("gpt2")
+    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    decode = lambda l: enc.decode(l)
 
-# Convert to the format model expects: [B, T, C, H, W]
-x = start_img.unsqueeze(1).to(device)  # [1, 1, 1, H, W]
+# ------------------------- start prompt -------------------------
+if start.startswith('FILE:'):
+    with open(start[5:], 'r', encoding='utf-8') as f:
+        start = f.read()
 
-# Run generation
-with torch.no_grad():
-    with ctx:
+# ------------------------- vision or text path -------------------------
+use_vision = getattr(model.config, 'use_vision_encoder', False)
+
+if use_vision:
+    # ===== Vision-conditioned generation =====
+    # 1) figure dataset/images folder
+    if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']:
+        dataset_name = checkpoint['config']['dataset']
+    else:
+        # fallback: try a common name; adjust if needed
+        dataset_name = 'chinese_char'
+    image_data_path = os.path.join('data', dataset_name, 'images')
+
+    # 2) build image bank: [V, 1, H, W] (can stay on CPU; generate() handles per-step fetch)
+    image_bank = load_images(image_data_path)
+    V = image_bank.shape[0]
+
+    # 3) sanity check vocab size vs image bank size
+    if hasattr(model.config, 'vocab_size') and model.config.vocab_size != V:
+        print(f"Warning: image_bank size ({V}) != model vocab_size ({model.config.vocab_size})")
+
+    # 4) build start_ids -> initial image sequence
+    #    If meta exists, encode(start) 给出一串 id；否则给一个默认 id [0]
+    if load_meta:
+        start_ids_list = encode(start)
+        if len(start_ids_list) == 0:
+            start_ids_list = [0]
+    else:
+        # 没有 meta 的情况下，图像->文本任务通常需要自定义符号表；这里给一个保底起始 id
+        start_ids_list = [0]
+
+    start_ids = torch.tensor(start_ids_list, dtype=torch.long, device=device)[None, ...]  # [1, T0]
+    # 索引 image_bank 得到起始图像序列 [1, T0, 1, H, W]
+    x0 = image_bank[start_ids[0].to('cpu')].unsqueeze(0)  # [1, T0, 1, H, W]
+    # 注意：不把整张 image_bank 搬到 GPU；generate() 每步只搬一个 id 对应的图像
+
+    with torch.no_grad(), ctx:
         for k in range(num_samples):
-            # Pass image_dataset to generate method
-            y_indices = model.generate(x, image_dataset, max_new_tokens, temperature=temperature, top_k=top_k)
-            
-            print(f"Sample {k+1} - Generated indices: {y_indices[0].tolist()}")
-            
-            # Load meta.pkl to get id->char mapping if available
-            meta_path = os.path.join(data_dir, 'meta.pkl')
-            if os.path.exists(meta_path):
-                with open(meta_path, 'rb') as f:
-                    meta = pickle.load(f)
-                itos = meta.get('itos', {})
-                
-                # Decode indices to characters
-                chars = [itos.get(idx, f'[UNK_{idx}]') for idx in y_indices[0].tolist()]
-                print(f"Generated text: {''.join(chars)}")
-            
+            y_ids = model.generate(
+                x0.clone().to(device),
+                max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                image_bank=image_bank,           # [V, 1, H, W] (on CPU is fine)
+                start_ids=start_ids.clone().to(device)  # [1, T0]
+            )
+            print(decode(y_ids[0].tolist()))
+            print('---------------')
+
+else:
+    # ===== Pure text generation (original path) =====
+    start_ids_list = encode(start)
+    x = torch.tensor(start_ids_list, dtype=torch.long, device=device)[None, ...]
+    with torch.no_grad(), ctx:
+        for k in range(num_samples):
+            y = model.generate(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
+            print(decode(y[0].tolist()))
             print('---------------')

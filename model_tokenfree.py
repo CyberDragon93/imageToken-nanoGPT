@@ -428,69 +428,63 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, image_dataset, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, image_bank=None, start_ids=None):
         """
-        Generate new tokens autoregressively.
-        
-        Args:
-            idx: Image tensor of shape (B, T, C, H, W) - initial prompt images
-            image_dataset: Tensor of shape (vocab_size, C, H, W) - lookup table for id->image
-            max_new_tokens: number of new tokens to generate
-            temperature: sampling temperature
-            top_k: if set, only sample from top k tokens
-        
-        Returns:
-            Generated token indices of shape (B, T+max_new_tokens)
+        两种模式：
+        - 文本模式（use_vision_encoder=False）：idx 为 LongTensor [B, T]，返回 [B, T+max_new_tokens]
+        - 视觉条件模式（use_vision_encoder=True）：
+            * idx 为图像序列 Float/BFloat16 Tensor [B, T0, C, H, W]
+            * 需提供 image_bank: Tensor [V, C, H, W]（id -> image 的查表）
+            * 可选 start_ids: LongTensor [B, T0]，与 idx 对应的起始 id；若提供，返回的 id 会包含它
+
+        返回：
+          - 文本模式：LongTensor [B, T+max_new_tokens]
+          - 视觉模式：LongTensor [B, T_ids + max_new_tokens]
         """
         if self.config.use_vision_encoder:
-            B = idx.shape[0]
-            T_init = idx.shape[1]  # initial sequence length
-            
-            # Initialize: track all generated indices (including initial ones if available)
-            # We'll only return the newly generated indices
-            generated_indices = []
-            
-            # Current image sequence
-            current_images = idx.clone()  # [B, T, C, H, W]
-            
-            for step in range(max_new_tokens):
-                # Crop context if too long
-                idx_cond = current_images if current_images.size(1) <= self.config.block_size else current_images[:, -self.config.block_size:]
-                
-                # Forward pass
-                logits, _ = self(idx_cond)
-                
-                # Get logits for last position and apply temperature
+            # --- 视觉条件生成 ---
+            assert idx.dim() == 5, f"Vision generate expects (B,T,C,H,W), got {tuple(idx.shape)}"
+            assert image_bank is not None, "image_bank (id->image table) is required when use_vision_encoder=True"
+
+            # 与视觉编码器权重对齐 device/dtype
+            weight = self.transformer.vte.patch[0].weight
+            img_seq = idx.to(device=weight.device, dtype=weight.dtype)  # [B, T0, C, H, W]
+            B, T0, C, H, W = img_seq.shape
+
+            # 维护 id 序列（可含起始 id）
+            if start_ids is not None:
+                assert start_ids.dim() == 2 and start_ids.shape[0] == B and start_ids.shape[1] == T0, \
+                    f"start_ids must be [B,T0]; got {tuple(start_ids.shape)} vs {[B,T0]}"
+                id_seq = start_ids.to(device=weight.device)
+            else:
+                id_seq = torch.empty((B, 0), dtype=torch.long, device=weight.device)
+
+            for _ in range(max_new_tokens):
+                # 上下文裁剪到 block_size
+                img_cond = img_seq if img_seq.size(1) <= self.config.block_size else img_seq[:, -self.config.block_size:]
+
+                # 前向得到最后一步的 logits
+                logits, _ = self(img_cond)             # [B, 1, V]
                 logits = logits[:, -1, :] / temperature
-                
-                # Top-k sampling
                 if top_k is not None:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float('Inf')
-                
-                # Sample next token index
                 probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)  # [B, 1]
-                generated_indices.append(idx_next)
-                
-                # Convert index to image and append to sequence
-                # idx_next: [B, 1], we need images of shape [B, 1, C, H, W]
-                next_images = []
-                for b in range(B):
-                    img_idx = idx_next[b, 0].item()
-                    next_images.append(image_dataset[img_idx])  # [C, H, W]
-                
-                next_images = torch.stack(next_images).unsqueeze(1)  # [B, 1, C, H, W]
-                next_images = next_images.to(current_images.device)
-                
-                # Concatenate to current sequence
-                current_images = torch.cat([current_images, next_images], dim=1)  # [B, T+step+1, C, H, W]
-            
-            # Return all generated indices: [B, max_new_tokens]
-            return torch.cat(generated_indices, dim=1)
-        
+
+                # 采样下一个 id
+                next_id = torch.multinomial(probs, num_samples=1)  # [B, 1]
+                id_seq = torch.cat((id_seq, next_id), dim=1)       # 追加到 id 轨迹
+
+                # id -> image（在 image_bank 上索引），然后拼到 img_seq，作为下一步输入
+                ids_cpu = next_id.squeeze(1).to('cpu') if image_bank.device.type == 'cpu' else next_id.squeeze(1)
+                next_imgs = image_bank[ids_cpu]                    # [B, C, H, W]
+                next_imgs = next_imgs.to(device=img_seq.device, dtype=img_seq.dtype).unsqueeze(1)  # [B,1,C,H,W]
+                img_seq = torch.cat((img_seq, next_imgs), dim=1)
+
+            return id_seq
+
         else:
-            # Original token-based generation (unchanged)
+            # --- 纯文本生成（原逻辑保持） ---
             for _ in range(max_new_tokens):
                 idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
                 logits, _ = self(idx_cond)
@@ -501,5 +495,4 @@ class GPT(nn.Module):
                 probs = F.softmax(logits, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)
                 idx = torch.cat((idx, idx_next), dim=1)
-            
             return idx
