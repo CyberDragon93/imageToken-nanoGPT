@@ -430,28 +430,25 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, image_bank=None, start_ids=None):
         """
-        两种模式：
-        - 文本模式（use_vision_encoder=False）：idx 为 LongTensor [B, T]，返回 [B, T+max_new_tokens]
-        - 视觉条件模式（use_vision_encoder=True）：
-            * idx 为图像序列 Float/BFloat16 Tensor [B, T0, C, H, W]
-            * 需提供 image_bank: Tensor [V, C, H, W]（id -> image 的查表）
-            * 可选 start_ids: LongTensor [B, T0]，与 idx 对应的起始 id；若提供，返回的 id 会包含它
-
-        返回：
-          - 文本模式：LongTensor [B, T+max_new_tokens]
-          - 视觉模式：LongTensor [B, T_ids + max_new_tokens]
+        Two modes of generation:
+        - text mode (use_vision_encoder=False): idx is LongTensor [B, T], returns [B, T+max_new_tokens]
+        - vision-conditioned mode (use_vision_encoder=True):
+            * idx is Float/BFloat16 Tensor of images [B, T0, C, H, W]
+            * requires image_bank: Tensor [V, C, H, W] (id->image lookup table)
+            * optional start_ids: LongTensor [B, T0], the starting ids corresponding to idx;
+              if provided, the returned ids will include them
+        Returns:
+          - text mode: LongTensor [B, T+max_new_tokens]
+          - vision mode: LongTensor [B, T_ids + max_new_tokens]
         """
         if self.config.use_vision_encoder:
-            # --- 视觉条件生成 ---
             assert idx.dim() == 5, f"Vision generate expects (B,T,C,H,W), got {tuple(idx.shape)}"
             assert image_bank is not None, "image_bank (id->image table) is required when use_vision_encoder=True"
 
-            # 与视觉编码器权重对齐 device/dtype
             weight = self.transformer.vte.patch[0].weight
             img_seq = idx.to(device=weight.device, dtype=weight.dtype)  # [B, T0, C, H, W]
             B, T0, C, H, W = img_seq.shape
 
-            # 维护 id 序列（可含起始 id）
             if start_ids is not None:
                 assert start_ids.dim() == 2 and start_ids.shape[0] == B and start_ids.shape[1] == T0, \
                     f"start_ids must be [B,T0]; got {tuple(start_ids.shape)} vs {[B,T0]}"
@@ -460,10 +457,10 @@ class GPT(nn.Module):
                 id_seq = torch.empty((B, 0), dtype=torch.long, device=weight.device)
 
             for _ in range(max_new_tokens):
-                # 上下文裁剪到 block_size
+                # crop to the last block_size tokens for efficiency
                 img_cond = img_seq if img_seq.size(1) <= self.config.block_size else img_seq[:, -self.config.block_size:]
 
-                # 前向得到最后一步的 logits
+                # forward the model to get the logits for the next token
                 logits, _ = self(img_cond)             # [B, 1, V]
                 logits = logits[:, -1, :] / temperature
                 if top_k is not None:
@@ -471,11 +468,11 @@ class GPT(nn.Module):
                     logits[logits < v[:, [-1]]] = -float('Inf')
                 probs = F.softmax(logits, dim=-1)
 
-                # 采样下一个 id
+                # sample from the distribution or take the most likely
                 next_id = torch.multinomial(probs, num_samples=1)  # [B, 1]
-                id_seq = torch.cat((id_seq, next_id), dim=1)       # 追加到 id 轨迹
+                id_seq = torch.cat((id_seq, next_id), dim=1)
 
-                # id -> image（在 image_bank 上索引），然后拼到 img_seq，作为下一步输入
+                # convert to image and append to the image sequence
                 ids_cpu = next_id.squeeze(1).to('cpu') if image_bank.device.type == 'cpu' else next_id.squeeze(1)
                 next_imgs = image_bank[ids_cpu]                    # [B, C, H, W]
                 next_imgs = next_imgs.to(device=img_seq.device, dtype=img_seq.dtype).unsqueeze(1)  # [B,1,C,H,W]
@@ -484,7 +481,7 @@ class GPT(nn.Module):
             return id_seq
 
         else:
-            # --- 纯文本生成（原逻辑保持） ---
+            # --- Original ---
             for _ in range(max_new_tokens):
                 idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
                 logits, _ = self(idx_cond)

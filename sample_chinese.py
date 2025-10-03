@@ -125,19 +125,15 @@ if use_vision:
         print(f"Warning: image_bank size ({V}) != model vocab_size ({model.config.vocab_size})")
 
     # 4) build start_ids -> initial image sequence
-    #    If meta exists, encode(start) 给出一串 id；否则给一个默认 id [0]
     if load_meta:
         start_ids_list = encode(start)
         if len(start_ids_list) == 0:
             start_ids_list = [0]
     else:
-        # 没有 meta 的情况下，图像->文本任务通常需要自定义符号表；这里给一个保底起始 id
         start_ids_list = [0]
 
     start_ids = torch.tensor(start_ids_list, dtype=torch.long, device=device)[None, ...]  # [1, T0]
-    # 索引 image_bank 得到起始图像序列 [1, T0, 1, H, W]
     x0 = image_bank[start_ids[0].to('cpu')].unsqueeze(0)  # [1, T0, 1, H, W]
-    # 注意：不把整张 image_bank 搬到 GPU；generate() 每步只搬一个 id 对应的图像
 
     with torch.no_grad(), ctx:
         for k in range(num_samples):
