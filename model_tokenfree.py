@@ -428,28 +428,78 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, image_dataset, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Generate new tokens autoregressively.
+        
+        Args:
+            idx: Image tensor of shape (B, T, C, H, W) - initial prompt images
+            image_dataset: Tensor of shape (vocab_size, C, H, W) - lookup table for id->image
+            max_new_tokens: number of new tokens to generate
+            temperature: sampling temperature
+            top_k: if set, only sample from top k tokens
+        
+        Returns:
+            Generated token indices of shape (B, T+max_new_tokens)
         """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
+        if self.config.use_vision_encoder:
+            B = idx.shape[0]
+            T_init = idx.shape[1]  # initial sequence length
+            
+            # Initialize: track all generated indices (including initial ones if available)
+            # We'll only return the newly generated indices
+            generated_indices = []
+            
+            # Current image sequence
+            current_images = idx.clone()  # [B, T, C, H, W]
+            
+            for step in range(max_new_tokens):
+                # Crop context if too long
+                idx_cond = current_images if current_images.size(1) <= self.config.block_size else current_images[:, -self.config.block_size:]
+                
+                # Forward pass
+                logits, _ = self(idx_cond)
+                
+                # Get logits for last position and apply temperature
+                logits = logits[:, -1, :] / temperature
+                
+                # Top-k sampling
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                
+                # Sample next token index
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)  # [B, 1]
+                generated_indices.append(idx_next)
+                
+                # Convert index to image and append to sequence
+                # idx_next: [B, 1], we need images of shape [B, 1, C, H, W]
+                next_images = []
+                for b in range(B):
+                    img_idx = idx_next[b, 0].item()
+                    next_images.append(image_dataset[img_idx])  # [C, H, W]
+                
+                next_images = torch.stack(next_images).unsqueeze(1)  # [B, 1, C, H, W]
+                next_images = next_images.to(current_images.device)
+                
+                # Concatenate to current sequence
+                current_images = torch.cat([current_images, next_images], dim=1)  # [B, T+step+1, C, H, W]
+            
+            # Return all generated indices: [B, max_new_tokens]
+            return torch.cat(generated_indices, dim=1)
+        
+        else:
+            # Original token-based generation (unchanged)
+            for _ in range(max_new_tokens):
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                logits, _ = self(idx_cond)
+                logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+            
+            return idx
