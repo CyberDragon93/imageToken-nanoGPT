@@ -252,9 +252,9 @@ def main():
                        help='Do not generate character images')
     parser.add_argument('--font', type=str, default='OTF/SimplifiedChinese/SourceHanSansSC-Regular.otf',
                        help='Font file path')
-    parser.add_argument('--img-size', type=int, default=64,
-                       help='Image size (default: 64)')
-    parser.add_argument('--font-size', type=int, default=48,
+    parser.add_argument('--img-size', type=int, default=32,
+                       help='Image size (default: 32)')
+    parser.add_argument('--font-size', type=int, default=30,
                        help='Font size (default: 48)')
     
     args = parser.parse_args()

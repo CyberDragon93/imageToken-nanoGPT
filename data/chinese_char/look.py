@@ -23,7 +23,7 @@ def inspect_meta(meta_path='meta.pkl'):
     
     # 映射示例
     print(f"\n🔗 映射示例 (前 10 个):")
-    for i in range(min(10, len(meta['chars']))):
+    for i in range(min(20, len(meta['chars']))):
         char = meta['chars'][i]
         char_id = meta['stoi'][char]
         print(f"  {i+1}. '{char}' -> ID: {char_id}")
@@ -33,7 +33,7 @@ def inspect_meta(meta_path='meta.pkl'):
         print(f"\n🖼️  图像映射:")
         print(f"  已生成图像数量: {len(meta['char_to_image']):,}")
         print(f"\n  示例:")
-        for i in range(min(10, len(meta['chars']))):
+        for i in range(min(20, len(meta['chars']))):
             char = meta['chars'][i]
             img = meta['char_to_image'].get(char, 'N/A')
             print(f"    '{char}' -> {img}")
