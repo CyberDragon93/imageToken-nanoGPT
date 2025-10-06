@@ -40,21 +40,22 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = '/scratch/10992/liaorunlong93/logs/nanoGPT-flow/chinese-baseline'
+date = time.strftime('%Y-%m-%d-%H-%M-%S')
+out_dir = '/scratch/10992/liaorunlong93/logs/nanoGPT_CHN_3G/chinese-baseline-aligned-' + date
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True # disabled by default
+wandb_project = 'nanoGPT_CHN_3G'
+wandb_run_name = 'chinese_3G_baseline' # 'run' + str(time.time())
 # data
 dataset = 'chinese_char'
-batch_size = 192 # micro-batch size per *optimizer step loop*, before GAS
-gradient_accumulation_steps = 1  # intended global GAS; will be adjusted by world_size below
-eval_interval = 2000 // gradient_accumulation_steps
+batch_size = 128 # micro-batch size per *optimizer step loop*, before GAS
+gradient_accumulation_steps = 2  # intended global GAS; will be adjusted by world_size below
+eval_interval = 1000
 block_size = 1024
 # model
 n_layer = 12
