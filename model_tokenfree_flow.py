@@ -213,6 +213,16 @@ class GPTConfig:
     patch_size: int = 2
     in_channels: int = 1
 
+    # TODO: add config for RF model
+    use_rf_loss: bool = True
+    rf_target_channels: int = 32 * 32
+    rf_z_channels: int = 768  # condition
+    rf_model_depth: int = 6
+    rf_model_channel: int = 768
+    rf_num_sampling_steps: int = 10
+    rf_grad_checkpointing: bool = False
+    rf_repeat: int = 4
+
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -255,6 +265,20 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
+        if config.use_rf_loss:
+            from models.RFloss import RFLoss
+            self.rf_loss_model = RFLoss(
+                target_channels=config.rf_target_channels,
+                z_channels=config.rf_z_channels,
+                depth=config.rf_model_depth,
+                width=config.rf_model_channel,
+                num_sampling_steps=config.rf_num_sampling_steps,
+                grad_checkpointing=config.rf_grad_checkpointing,
+                device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            )
+        else:
+            self.rf_loss_model = None
+
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -278,7 +302,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, image_bank=None):
         if self.config.use_vision_encoder:
             encoder = self.transformer.vte
             if idx.dim() != 5:
@@ -301,12 +325,21 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb + pos_emb) # (b, t, n_embd)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
-
-        if targets is not None:
+        x = self.transformer.ln_f(x)  # (b, t, n_embd), which is condition z
+        B, T , _ = x.size()
+        if targets is not None and self.config.use_rf_loss:
+            assert image_bank is not None, "image_bank required for RF loss"
+            # targets: (B, T) -> (B * T, )
+            targets_flat = targets.view(-1)
+            target_images = image_bank[targets_flat]  # (B*T, C, H, W)
+            target_images_flat = target_images.view(B*T, -1).repeat(self.config.rf_repeat, 1)  # (B*T, C*H*W), repeat
+            z = x.view(B*T, -1).repeat(self.config.rf_repeat, 1)
+            loss = self.rf_loss_model(target_images_flat, z)
+            logits = None
+        elif targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
@@ -314,6 +347,7 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+
 
         return logits, loss
 
