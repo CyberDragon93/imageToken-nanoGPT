@@ -38,13 +38,13 @@ from torchvision import transforms
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from model_tokenfree import GPTConfig, GPT
+from model_tokenfree_flow import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = '/scratch/10992/liaorunlong93/logs/nanoGPT-flow/chinese-image'
+out_dir = '/work/11018/jian03/vista/results/nano/chinese-image'
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -56,7 +56,7 @@ wandb_project = 'nanoGPT-flow'
 wandb_run_name = 'tokenizer-free-1' # 'run' + str(time.time())
 # data
 dataset = 'chinese_char'
-batch_size = 128 # micro-batch size per *optimizer step loop*, before GAS
+batch_size = 32 # micro-batch size per *optimizer step loop*, before GAS
 gradient_accumulation_steps = 2  # intended global GAS; will be adjusted by world_size below
 eval_interval = 2000 // gradient_accumulation_steps
 block_size = 1024
@@ -89,7 +89,7 @@ lr_decay_iters = 600000 // gradient_accumulation_steps # should be ~= max_iters 
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # accelerate + compile settings
 mixed_precision = 'auto'  # 'auto' -> bf16 if supported else fp16; or explicitly 'bf16'/'fp16'/'no'
-compile = True            # use PyTorch 2.0 to compile the model to be faster
+compile = False            # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -203,7 +203,7 @@ def get_batch(split):
     
     if image_dataset is not None:
         x = image_dataset[x_ids]
-        y = y_ids
+        y = image_dataset[y_ids]
     else:
         # Otherwise, retain the original behavior (use IDs as data)
         x, y = x_ids, y_ids
@@ -299,7 +299,7 @@ if compile:
     if accelerator.is_main_process:
         print("compiling the model... (PyTorch 2.x)")
     model = torch.compile(model)  # you can set mode="max-autotune" if desired
-
+    print("compile successfully")
 # Let Accelerate wrap model/optimizer (DDP, autocast, scaler handled inside)
 model, optimizer = accelerator.prepare(model, optimizer)
 
@@ -308,6 +308,7 @@ model, optimizer = accelerator.prepare(model, optimizer)
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
+    print("Eval")
     # Keep it simple: only rank 0 runs eval to avoid redundant IO/compute.
     # This is acceptable here and avoids extra gather code.
     if not accelerator.is_main_process:
@@ -319,7 +320,8 @@ def estimate_loss():
         for _ in range(eval_iters):
             X, Y = get_batch(split)
             with accelerator.autocast():
-                _, loss = model(X, Y, image_bank=image_bank)
+                _, loss = model(X, Y)
+                print(loss)
             losses.append(loss.item())
         out[split] = float(np.mean(losses))
     model.train()
@@ -348,7 +350,6 @@ if wandb_log and accelerator.is_main_process:
 t0 = time.time()
 local_iter_num = 0
 running_mfu = -1.0
-
 while True:
     # set LR for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -357,7 +358,7 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
 
-    if iter_num % eval_interval == 0:
+    if iter_num !=0 and iter_num % eval_interval == 0:
         # accelerator.wait_for_everyone()
         losses = estimate_loss()
         if accelerator.is_main_process:
@@ -392,6 +393,7 @@ while True:
 
     # ---------- forward/backward/update with gradient accumulation ----------
     # We preserve original semantics: micro-step loss is divided by GAS to average gradients.
+    print("Train")
     total_micro_loss = 0.0
     with accelerator.accumulate(model):
         for micro_step in range(eff_gas):
@@ -406,7 +408,6 @@ while True:
             accelerator.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         optimizer.zero_grad()
-
     # timing & logging
     t1 = time.time()
     dt = t1 - t0

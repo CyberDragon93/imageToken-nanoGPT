@@ -145,7 +145,7 @@ class VisionEncoderTiny(nn.Module):
         self.head = ResidualBottleneckMLP(emb_dim, r=mlp_bottleneck_r, dropout=dropout)
         self.out_ln = nn.LayerNorm(emb_dim)
 
-    @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
+    # @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
     def _encode_flat(self, x):
         x = self.patch(x)     # -> (N, stemC, H/4, W/4)
         x = self.block(x)     # -> (N, emb,   H/8, W/8)  (若 use_dw_block)
@@ -314,15 +314,12 @@ class GPT(nn.Module):
             if idx.dim() != 2:
                 raise ValueError(f"GPT expects token indices of shape (B, T), got {tuple(idx.shape)}")
             tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-
         b, t, _ = tok_emb.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         if self._vision_tokens is not None and t != self._vision_tokens:
             raise ValueError(f"Vision encoder produced {t} tokens, expected {self._vision_tokens}")
-        
         device = tok_emb.device
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
         # forward the GPT model itself
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb) # (b, t, n_embd)
@@ -331,11 +328,7 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)  # (b, t, n_embd), which is condition z
         B, T , _ = x.size()
         if targets is not None and self.config.use_rf_loss:
-            assert image_bank is not None, "image_bank required for RF loss"
-            # targets: (B, T) -> (B * T, )
-            targets_flat = targets.view(-1)
-            target_images = image_bank[targets_flat]  # (B*T, C, H, W)
-            target_images_flat = target_images.view(B*T, -1).repeat(self.config.rf_repeat, 1)  # (B*T, C*H*W), repeat
+            target_images_flat = targets.view(B*T, -1).repeat(self.config.rf_repeat, 1)  # (B*T, C*H*W), repeat
             z = x.view(B*T, -1).repeat(self.config.rf_repeat, 1)
             loss = self.rf_loss_model(target_images_flat, z)
             logits = None
@@ -347,8 +340,6 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-
-
         return logits, loss
 
     def crop_block_size(self, block_size):
