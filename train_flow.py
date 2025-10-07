@@ -71,11 +71,11 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 use_rf_loss = True
 rf_target_channels = 1 * 32 * 32  # 1024，根据图片大小调整
 rf_z_channels = 768  # 与 n_embd 一致
-rf_model_depth = 8
+rf_model_depth = 6
 rf_model_channel = 1024
 rf_num_sampling_steps = 10
 rf_grad_checkpointing = False
-rf_repeat = 4
+rf_repeat = 6
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -394,7 +394,7 @@ while True:
         for micro_step in range(eff_gas):
             X, Y = get_batch('train')  # X: (batch_size, block_size, 1, H, W), Y: (batch_size, block_size)
             with accelerator.autocast():
-                logits, loss = model(X, Y, image_bank=None)
+                logits, loss = model(X, Y)
             total_micro_loss += loss.item()
             loss = loss / eff_gas
             accelerator.backward(loss)
@@ -403,7 +403,7 @@ while True:
             accelerator.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         optimizer.zero_grad()
-        
+
     # timing & logging
     t1 = time.time()
     dt = t1 - t0
