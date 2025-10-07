@@ -38,7 +38,7 @@ from torchvision import transforms
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from model_tokenfree import GPTConfig, GPT
+from model_imgtoken import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText

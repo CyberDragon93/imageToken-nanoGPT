@@ -11,7 +11,7 @@ import tiktoken
 from PIL import Image
 from torchvision import transforms
 
-from model_tokenfree import GPTConfig, GPT
+from model_imgtoken import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 init_from = 'resume'  # 'resume' or a gpt2 variant (e.g. 'gpt2-xl')
