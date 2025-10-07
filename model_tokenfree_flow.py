@@ -145,7 +145,7 @@ class VisionEncoderTiny(nn.Module):
         self.head = ResidualBottleneckMLP(emb_dim, r=mlp_bottleneck_r, dropout=dropout)
         self.out_ln = nn.LayerNorm(emb_dim)
 
-    # @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
+    @torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
     def _encode_flat(self, x):
         x = self.patch(x)     # -> (N, stemC, H/4, W/4)
         x = self.block(x)     # -> (N, emb,   H/8, W/8)  (若 use_dw_block)
@@ -167,22 +167,94 @@ class VisionEncoderTiny(nn.Module):
 
 
 class VisionEncoderFlattenMLPQiang(nn.Module):
-    """Embed images as a sequence of patch tokens compatible with GPT."""
-
-    def __init__(self, image_size, patch_size, in_channels, emb_dim, vocab_size):
+    """
+    Embed (B, T, C, H, W) images into (B, T, emb_dim) using a 2-layer MLP.
+    The hidden width is chosen to match the parameter count of a V x emb_dim word embedding.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        image_size: int,
+        emb_dim: int,
+        vocab_size: int,
+        hidden_width: int | None = None,
+    ):
         super().__init__()
-        assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
+        self.in_channels = in_channels
+        self.image_size = image_size
+        self.emb_dim = emb_dim
+        self.vocab_size = vocab_size
+
+        P = in_channels * image_size * image_size  # flatten input dim
+        E = emb_dim
+        V = vocab_size
+
+        if hidden_width is None:
+            # Solve for H ~= (V*E - E) / (P + E + 1), then choose the closer of floor/ceil.
+            H_real = (V * E - E) / (P + E + 1)
+            H_floor = max(1, int(math.floor(H_real)))
+            H_ceil  = max(1, int(math.ceil(H_real)))
+
+            def mlp_params(H: int) -> int:
+                return P*H + H + H*E + E  # include biases
+
+            target = V * E  # word embedding params (no bias)
+            pf, pc = mlp_params(H_floor), mlp_params(H_ceil)
+            self.hidden_width = H_floor if abs(pf - target) <= abs(pc - target) else H_ceil
+        else:
+            self.hidden_width = int(hidden_width)
+            assert self.hidden_width > 0
+
+        H = self.hidden_width
+
         self.mlp = nn.Sequential(
-            nn.Linear(in_channels * image_size * image_size, vocab_size),
+            nn.Linear(P, H),
             nn.GELU(),
-            nn.Linear(vocab_size, emb_dim)
+            nn.Linear(H, E),
         )
 
-    def forward(self, images):
-        if images.dim() != 4:
-            raise ValueError(f"VisionEncoder expects inputs of shape (B, C, H, W), got {tuple(images.shape)}")
-        x = self.mlp(images.reshape(images.shape[0], -1))
-        return x    
+        self._init_weights()
+
+        print(f"VisionEncoderFlattenMLPQiang has {self.param_count:,} params, "
+              f"target {self.target_param_count:,} params, "
+              f"hidden_width={self.hidden_width}")
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    @property
+    def param_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    @property
+    def target_param_count(self) -> int:
+        return self.vocab_size * self.emb_dim
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        images: (B, T, C, H, W) or (B, C, H, W)
+        returns: (B, T, emb_dim)
+        """
+        if images.dim() == 4:
+            images = images.unsqueeze(1)
+        if images.dim() != 5:
+            raise ValueError(f"Expected (B,T,C,H,W) or (B,C,H,W), got {tuple(images.shape)}")
+
+        B, T, C, H, W = images.shape
+        if (C != self.in_channels) or (H != self.image_size) or (W != self.image_size):
+            raise ValueError(
+                f"Input (C,H,W)=({C},{H},{W}) does not match encoder config "
+                f"({self.in_channels},{self.image_size},{self.image_size})."
+            )
+
+        x = images.reshape(B*T, C*H*W)   # flatten per token
+        x = self.mlp(x)                  # (B*T, emb_dim)
+        x = x.view(B, T, self.emb_dim)   # (B, T, emb_dim)
+        return x
 
 
 class Block(nn.Module):
@@ -209,17 +281,17 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_vision_encoder: bool = True
-    image_size: int = 64
+    image_size: int = 32
     patch_size: int = 2
     in_channels: int = 1
 
-    # TODO: add config for RF model
+    # add config for RF model
     use_rf_loss: bool = True
     rf_target_channels: int = 32 * 32
     rf_z_channels: int = 768  # condition
     rf_model_depth: int = 6
     rf_model_channel: int = 768
-    rf_num_sampling_steps: int = 10
+    rf_num_sampling_steps: int = 100
     rf_grad_checkpointing: bool = False
     rf_repeat: int = 4
 
@@ -234,10 +306,16 @@ class GPT(nn.Module):
         modules = {}
         self._vision_tokens = None
         if config.use_vision_encoder:
-            vision_encoder = VisionEncoderTiny(
+            # vision_encoder = VisionEncoderTiny(
+            #     in_channels=config.in_channels,
+            #     emb_dim=config.n_embd,
+            #     dropout=config.dropout,
+            # )
+            vision_encoder = VisionEncoderFlattenMLPQiang(
                 in_channels=config.in_channels,
+                image_size=config.image_size,
                 emb_dim=config.n_embd,
-                dropout=config.dropout,
+                vocab_size=config.vocab_size,
             )
             modules['vte'] = vision_encoder
         else:
@@ -302,24 +380,28 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, image_bank=None):
+    def forward(self, idx, targets=None):
         if self.config.use_vision_encoder:
             encoder = self.transformer.vte
             if idx.dim() != 5:
                 raise ValueError(f"Vision encoder expects inputs of shape (B, T, C, H, W), got {tuple(idx.shape)}")
-            weight = encoder.patch[0].weight
+            # weight = encoder.patch[0].weight
+            weight = encoder.mlp[0].weight
             idx = idx.to(device=weight.device, dtype=weight.dtype)
             tok_emb = encoder(idx) # (b, num_patches, n_embd)
         else:
             if idx.dim() != 2:
                 raise ValueError(f"GPT expects token indices of shape (B, T), got {tuple(idx.shape)}")
             tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+
         b, t, _ = tok_emb.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         if self._vision_tokens is not None and t != self._vision_tokens:
             raise ValueError(f"Vision encoder produced {t} tokens, expected {self._vision_tokens}")
+        
         device = tok_emb.device
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
         # forward the GPT model itself
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb) # (b, t, n_embd)
@@ -328,7 +410,7 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)  # (b, t, n_embd), which is condition z
         B, T , _ = x.size()
         if targets is not None and self.config.use_rf_loss:
-            target_images_flat = targets.view(B*T, -1).repeat(self.config.rf_repeat, 1)  # (B*T, C*H*W), repeat
+            target_images_flat = targets.view(B*T, -1).repeat(self.config.rf_repeat, 1)  # (B*T*repeat, C*H*W), repeat
             z = x.view(B*T, -1).repeat(self.config.rf_repeat, 1)
             loss = self.rf_loss_model(target_images_flat, z)
             logits = None
@@ -470,7 +552,8 @@ class GPT(nn.Module):
             assert idx.dim() == 5, f"Vision generate expects (B,T,C,H,W), got {tuple(idx.shape)}"
             assert image_bank is not None, "image_bank (id->image table) is required when use_vision_encoder=True"
 
-            weight = self.transformer.vte.patch[0].weight
+            # weight = self.transformer.vte.patch[0].weight
+            weight = self.transformer.vte.mlp[0].weight
             img_seq = idx.to(device=weight.device, dtype=weight.dtype)  # [B, T0, C, H, W]
             B, T0, C, H, W = img_seq.shape
 

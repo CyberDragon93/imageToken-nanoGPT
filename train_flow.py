@@ -44,7 +44,8 @@ from model_tokenfree_flow import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # -----------------------------------------------------------------------------
 # I/O
-out_dir = '/work/11018/jian03/vista/results/nano/chinese-image'
+date = time.strftime('%Y-%m-%d-%H-%M-%S')
+out_dir = '/scratch/10992/liaorunlong93/logs/nanoGPT_CHN_3G/chinese-image-flowhead-' + date
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -52,12 +53,12 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
-wandb_project = 'nanoGPT-flow'
-wandb_run_name = 'tokenizer-free-1' # 'run' + str(time.time())
+wandb_project = 'nanoGPT_CHN_3G'
+wandb_run_name = 'img_tokenizerf-flow_head' # 'run' + str(time.time())
 # data
 dataset = 'chinese_char'
-batch_size = 32 # micro-batch size per *optimizer step loop*, before GAS
-gradient_accumulation_steps = 2  # intended global GAS; will be adjusted by world_size below
+batch_size = 64 # micro-batch size per *optimizer step loop*, before GAS
+gradient_accumulation_steps = 4  # intended global GAS; will be adjusted by world_size below
 eval_interval = 2000 // gradient_accumulation_steps
 block_size = 1024
 # model
@@ -70,8 +71,8 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 use_rf_loss = True
 rf_target_channels = 1 * 32 * 32  # 1024，根据图片大小调整
 rf_z_channels = 768  # 与 n_embd 一致
-rf_model_depth = 6
-rf_model_channel = 768
+rf_model_depth = 8
+rf_model_channel = 1024
 rf_num_sampling_steps = 10
 rf_grad_checkpointing = False
 rf_repeat = 4
@@ -89,7 +90,7 @@ lr_decay_iters = 600000 // gradient_accumulation_steps # should be ~= max_iters 
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # accelerate + compile settings
 mixed_precision = 'auto'  # 'auto' -> bf16 if supported else fp16; or explicitly 'bf16'/'fp16'/'no'
-compile = False            # use PyTorch 2.0 to compile the model to be faster
+compile = True            # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -187,8 +188,7 @@ if dataset == 'chinese_char':
     else:
         if accelerator.is_main_process:
             print(f"Warning: dataset is '{dataset}' but image directory not found at {image_data_path}")
-if image_dataset is not None:
-    image_bank = image_dataset
+
 def get_batch(split):
     # Same "poor man's dataloader" with memmap, keeping RAM usage predictable.
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -288,8 +288,6 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size
 
 model.to(device)
-if image_bank is not None:
-    image_bank = image_bank.to(device)
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -299,7 +297,7 @@ if compile:
     if accelerator.is_main_process:
         print("compiling the model... (PyTorch 2.x)")
     model = torch.compile(model)  # you can set mode="max-autotune" if desired
-    print("compile successfully")
+
 # Let Accelerate wrap model/optimizer (DDP, autocast, scaler handled inside)
 model, optimizer = accelerator.prepare(model, optimizer)
 
@@ -308,7 +306,6 @@ model, optimizer = accelerator.prepare(model, optimizer)
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
-    print("Eval")
     # Keep it simple: only rank 0 runs eval to avoid redundant IO/compute.
     # This is acceptable here and avoids extra gather code.
     if not accelerator.is_main_process:
@@ -321,7 +318,6 @@ def estimate_loss():
             X, Y = get_batch(split)
             with accelerator.autocast():
                 _, loss = model(X, Y)
-                print(loss)
             losses.append(loss.item())
         out[split] = float(np.mean(losses))
     model.train()
@@ -393,13 +389,12 @@ while True:
 
     # ---------- forward/backward/update with gradient accumulation ----------
     # We preserve original semantics: micro-step loss is divided by GAS to average gradients.
-    print("Train")
     total_micro_loss = 0.0
     with accelerator.accumulate(model):
         for micro_step in range(eff_gas):
             X, Y = get_batch('train')  # X: (batch_size, block_size, 1, H, W), Y: (batch_size, block_size)
             with accelerator.autocast():
-                logits, loss = model(X, Y, image_bank=image_bank)
+                logits, loss = model(X, Y, image_bank=None)
             total_micro_loss += loss.item()
             loss = loss / eff_gas
             accelerator.backward(loss)
@@ -408,6 +403,7 @@ while True:
             accelerator.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         optimizer.zero_grad()
+        
     # timing & logging
     t1 = time.time()
     dt = t1 - t0
