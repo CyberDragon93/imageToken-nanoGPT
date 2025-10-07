@@ -524,7 +524,8 @@ class GPT(nn.Module):
             assert idx.dim() == 5, f"Vision generate expects (B,T,C,H,W), got {tuple(idx.shape)}"
             assert image_bank is not None, "image_bank (id->image table) is required when use_vision_encoder=True"
 
-            weight = self.transformer.vte.patch[0].weight
+            # weight = self.transformer.vte.patch[0].weight
+            weight = self.transformer.vte.mlp[0].weight
             img_seq = idx.to(device=weight.device, dtype=weight.dtype)  # [B, T0, C, H, W]
             B, T0, C, H, W = img_seq.shape
 
