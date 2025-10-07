@@ -380,19 +380,20 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward_gpt_encoder(self, imgs):
         if self.config.use_vision_encoder:
             encoder = self.transformer.vte
-            if idx.dim() != 5:
-                raise ValueError(f"Vision encoder expects inputs of shape (B, T, C, H, W), got {tuple(idx.shape)}")
+            if imgs.dim() != 5:
+                raise ValueError(f"Vision encoder expects inputs of shape (B, T, C, H, W), got {tuple(imgs.shape)}")
             # weight = encoder.patch[0].weight
             weight = encoder.mlp[0].weight
-            idx = idx.to(device=weight.device, dtype=weight.dtype)
-            tok_emb = encoder(idx) # (b, num_patches, n_embd)
+            imgs = imgs.to(device=weight.device, dtype=weight.dtype)
+            tok_emb = encoder(imgs) # (b, num_patches, n_embd)
         else:
-            if idx.dim() != 2:
-                raise ValueError(f"GPT expects token indices of shape (B, T), got {tuple(idx.shape)}")
-            tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+            # if imgs.dim() != 2:
+            #     raise ValueError(f"GPT expects token indices of shape (B, T), got {tuple(imgs.shape)}")
+            # tok_emb = self.transformer.wte(imgs) # token embeddings of shape (b, t, n_embd)
+            raise ValueError("GPT model without vision encoder is not supported here.")
 
         b, t, _ = tok_emb.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -407,7 +408,11 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb) # (b, t, n_embd)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)  # (b, t, n_embd), which is condition z
+        x = self.transformer.ln_f(x)  # (b, t, n_embd), the condition z for RF
+        return x
+
+    def forward(self, idx, targets=None):
+        x = self.forward_gpt_encoder(idx)
         B, T , _ = x.size()
         if targets is not None and self.config.use_rf_loss:
             target_images_flat = targets.view(B*T, -1).repeat(self.config.rf_repeat, 1)  # (B*T*repeat, C*H*W), repeat
@@ -416,12 +421,12 @@ class GPT(nn.Module):
             logits = None
         elif targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # logits = self.lm_head(x)
+            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            raise ValueError("GPT model without RF loss is not supported here.")
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            raise ValueError("targets must be provided when using RF loss.")
+
         return logits, loss
 
     def crop_block_size(self, block_size):
@@ -535,69 +540,90 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, image_bank=None, start_ids=None):
-        """
-        Two modes of generation:
-        - text mode (use_vision_encoder=False): idx is LongTensor [B, T], returns [B, T+max_new_tokens]
-        - vision-conditioned mode (use_vision_encoder=True):
-            * idx is Float/BFloat16 Tensor of images [B, T0, C, H, W]
-            * requires image_bank: Tensor [V, C, H, W] (id->image lookup table)
-            * optional start_ids: LongTensor [B, T0], the starting ids corresponding to idx;
-              if provided, the returned ids will include them
-        Returns:
-          - text mode: LongTensor [B, T+max_new_tokens]
-          - vision mode: LongTensor [B, T_ids + max_new_tokens]
-        """
-        if self.config.use_vision_encoder:
-            assert idx.dim() == 5, f"Vision generate expects (B,T,C,H,W), got {tuple(idx.shape)}"
-            assert image_bank is not None, "image_bank (id->image table) is required when use_vision_encoder=True"
+    def generate(self, idx, max_new_tokens, image_bank=None, return_images=False, cfg=1.0):
+        import time, pathlib, torch
+        from torchvision.utils import save_image, make_grid
 
-            # weight = self.transformer.vte.patch[0].weight
-            weight = self.transformer.vte.mlp[0].weight
-            img_seq = idx.to(device=weight.device, dtype=weight.dtype)  # [B, T0, C, H, W]
-            B, T0, C, H, W = img_seq.shape
+        def _to01(x):  # [-1,1] -> [0,1]
+            return (x.clamp(-1, 1) + 1) * 0.5
 
-            if start_ids is not None:
-                assert start_ids.dim() == 2 and start_ids.shape[0] == B and start_ids.shape[1] == T0, \
-                    f"start_ids must be [B,T0]; got {tuple(start_ids.shape)} vs {[B,T0]}"
-                id_seq = start_ids.to(device=weight.device)
-            else:
-                id_seq = torch.empty((B, 0), dtype=torch.long, device=weight.device)
+        time_str = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+        save_dir = f"/scratch/10992/liaorunlong93/logs/nanoGPT_CHN_3G/chinese-image-flowhead-sample{time_str}"
+        base = pathlib.Path(save_dir)
+        (base / "by_step").mkdir(parents=True, exist_ok=True)
 
-            for _ in range(max_new_tokens):
-                # crop to the last block_size tokens for efficiency
-                img_cond = img_seq if img_seq.size(1) <= self.config.block_size else img_seq[:, -self.config.block_size:]
+        if not (self.config.use_vision_encoder and self.config.use_rf_loss):
+            raise ValueError("Only vision-conditioned generation with RF loss is supported here.")
+        assert idx.dim() == 5, f"Vision generate expects (B,T,C,H,W), got {tuple(idx.shape)}"
+        assert image_bank is not None, "image_bank (id->image table) is required when use_vision_encoder=True"
 
-                # forward the model to get the logits for the next token
-                logits, _ = self(img_cond)             # [B, 1, V]
-                logits = logits[:, -1, :] / temperature
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
+        try:
+            ref_param = self.transformer.vte.mlp[0].weight
+        except Exception:
+            ref_param = next(self.transformer.parameters())
+        device_ref, dtype_ref = ref_param.device, ref_param.dtype
 
-                # sample from the distribution or take the most likely
-                next_id = torch.multinomial(probs, num_samples=1)  # [B, 1]
-                id_seq = torch.cat((id_seq, next_id), dim=1)
+        id_seq = None
 
-                # convert to image and append to the image sequence
-                ids_cpu = next_id.squeeze(1).to('cpu') if image_bank.device.type == 'cpu' else next_id.squeeze(1)
-                next_imgs = image_bank[ids_cpu]                    # [B, C, H, W]
-                next_imgs = next_imgs.to(device=img_seq.device, dtype=img_seq.dtype).unsqueeze(1)  # [B,1,C,H,W]
-                img_seq = torch.cat((img_seq, next_imgs), dim=1)
+        bank_imgs = image_bank.to(device=device_ref, dtype=dtype_ref, non_blocking=True)  # [V,C,H,W]
+        bank_flat = bank_imgs.flatten(1).to(dtype=torch.float32)                          # [V,P]
+        bank_b2 = (bank_flat ** 2).sum(dim=1, keepdim=True).t() 
 
+        assert idx.dim() == 5, f"Vision generate expects (B,T,C,H,W), got {tuple(idx.shape)}"
+        assert image_bank is not None, "image_bank (id->image table) is required when use_vision_encoder=True"
+
+        # weight = self.transformer.vte.patch[0].weight
+        weight = self.transformer.vte.mlp[0].weight
+        img_seq = idx.to(device=weight.device, dtype=weight.dtype)  # [B, T0, C, H, W]
+        print(f"Prompt image sequence shape: {tuple(img_seq.shape)}")
+        
+        B, T0, C, H, W = img_seq.shape
+        P = C * H * W
+        assert self.config.rf_target_channels == P, \
+            f"rf_target_channels={self.config.rf_target_channels} != C*H*W={P}"
+
+        steps = 200
+        for t_new in range(max_new_tokens):
+            img_cond = img_seq if img_seq.size(1) <= self.config.block_size else img_seq[:, -self.config.block_size:]
+
+            x = self.forward_gpt_encoder(img_cond)  # [B,T,n_embd]
+            z_last = x[:, -1, :]                    # [B,n_embd]
+            z_last_rf = z_last.to(device=self.rf_loss_model.device, dtype=self.rf_loss_model.dtype, non_blocking=True)
+
+            new_flat = self.rf_loss_model.sample(z_last_rf, num_steps=steps, cfg=cfg)  # [B,P]
+            new_imgs = (
+                new_flat.view(B, C, H, W)
+                .to(device=img_seq.device, dtype=img_seq.dtype, non_blocking=True)
+                .clamp_(-1.0, 1.0)
+            )
+
+            q = new_imgs.reshape(B, -1).to(dtype=torch.float32)     # [B,P]
+            a2 = (q ** 2).sum(dim=1, keepdim=True)                  # [B,1]
+            ab = q @ bank_flat.t()                                  # [B,V]
+            d2 = a2 + bank_b2 - 2.0 * ab                            # [B,V]
+            nn_id = torch.argmin(d2, dim=1, keepdim=True)           # [B,1], dtype=long
+
+            id_seq = nn_id if id_seq is None else torch.cat([id_seq, nn_id], dim=1)
+
+            # --- 保存成对对比图（相同前缀） ---
+            # 单图：bXX_tYYY_gen.png & bXX_tYYY_nn.png
+            gen01 = _to01(new_imgs.detach().cpu())
+            nn_imgs = bank_imgs[nn_id.squeeze(1)].to(device="cpu", non_blocking=True)  # [B,C,H,W]
+            nn01 = _to01(nn_imgs)
+
+            for b in range(B):
+                prefix = base / f"b{b:02d}_t{t_new:03d}"
+                save_image(gen01[b], str(prefix) + "_gen.png")
+                save_image(nn01[b], str(prefix) + "_nn.png")
+
+            # --- 用最近邻作为下一 token 的“图片输入” ---
+            next_imgs = bank_imgs[nn_id.squeeze(1)].to(device=img_seq.device, dtype=img_seq.dtype, non_blocking=True)
+            img_seq = torch.cat([img_seq, next_imgs.unsqueeze(1)], dim=1)
+
+        if return_images:
+        # 返回的是“驱动过的序列”（其中后续 token 已被替换为 NN）
+            return img_seq
+        else:
+            # 返回 id 轨迹（每步最邻近的 bank 索引）
             return id_seq
 
-        else:
-            # --- Original ---
-            for _ in range(max_new_tokens):
-                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-                logits, _ = self(idx_cond)
-                logits = logits[:, -1, :] / temperature
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat((idx, idx_next), dim=1)
-            return idx
