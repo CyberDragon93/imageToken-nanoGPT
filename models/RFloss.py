@@ -18,12 +18,24 @@ class RFLoss(nn.Module):
         width: int,
         num_sampling_steps: int,
         grad_checkpointing: bool = False,
-        device: torch.device = torch.device("cpu"),
+        cfg_dropout_p: float = 0.0,   # 可选：训练时做无条件dropout
+        learn_null: bool = False,     # 可选：学一个null token
+        device: torch.device = torch.device("cuda"),
+        dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         self.in_channels = target_channels
         self.num_sampling_steps = num_sampling_steps
+        self.cfg_dropout_p = cfg_dropout_p
+
+        self.learn_null = learn_null
+        self.null_token = None
+        if learn_null:
+            self.null_token = nn.Parameter(torch.zeros(1, z_channels, device=device, dtype=dtype))
+
         self.device = device
+        self.dtype = dtype
+
         self.net = SimpleMLPAdaLN(
             in_channels=target_channels,
             model_channels=width,
@@ -31,50 +43,95 @@ class RFLoss(nn.Module):
             z_channels=z_channels,
             num_res_blocks=depth,
             grad_checkpointing=grad_checkpointing,
-        )
-        self.rf = RectifiedFlow(
+        ).to(device=device, dtype=dtype)
+
+        self.rf_train = RectifiedFlow(
             data_shape=(target_channels,),
             velocity_field=lambda x_t, t, z: self.net(x_t, t, z),
             device=device,
-            dtype=torch.float32,
+            dtype=dtype,
+        )
+
+        self.rf_infer = RectifiedFlow(
+            data_shape=(target_channels,),
+            velocity_field=lambda x_t, t: x_t,  # placeholder, will be set in sample()
+            device=device,
+            dtype=dtype,
         )
 
     def forward(self, target, z, mask=None, return_patch_loss=False):
-        # target: (B*T, C*H*W), flow head act on the flattened image
-        # z: (B*T, n_embed), each target character has one condition
-        t = self.rf.sample_train_time(target.shape[0])
+        if self.cfg_dropout_p > 0.0:
+            with torch.no_grad():
+                drop = (torch.rand(z.shape[0], device=z.device) < self.cfg_dropout_p).float().unsqueeze(1)
+            if self.null_token is not None:
+                z = torch.where(drop.bool().expand_as(z), self.null_token.expand_as(z), z)
+            else:
+                z = z * (1.0 - drop)
+
+        t = self.rf_train.sample_train_time(target.shape[0])
         x_0 = torch.randn_like(target)
-        x_t, dot_x_t = self.rf.get_interpolation(x_0=x_0, x_1=target, t=t)
-        velocity = self.rf.get_velocity(x_t=x_t, t=t, z=z)
+        x_t, dot_x_t = self.rf_train.get_interpolation(x_0=x_0, x_1=target, t=t)
+        velocity = self.rf_train.get_velocity(x_t=x_t, t=t, z=z)
         loss = torch.mean((velocity - dot_x_t) ** 2, dim=1)
+
         patch_loss = loss.detach().clone()
         if mask is not None:
-            loss = (loss * mask).sum() / mask.sum()
+            loss = (loss * mask.view(loss.shape[0])).sum() / mask.sum()
 
-        if return_patch_loss:
-            return loss.mean(), patch_loss
-        else:
-            return loss.mean()
+        return (loss.mean(), patch_loss) if return_patch_loss else loss.mean()
     
-    def sample(self, z, temperature=1.0, cfg=1.0):
-        # temperature is a useless parameter here
-        # set cfg to 1.0 to disable CFG
+    @torch.no_grad()
+    def sample(
+        self,
+        z_cond,
+        num_steps: int = None,
+        cfg: float = 1.0,
+    ):
+        """
+        B is batch * sequence length here.
+        z_cond: (B, z_channels)
+        z_uncond: (B, z_channels) 或 (1, z_channels). 若为 None 且 cfg!=1, 尝试用 null token 或全零。
+        """
+        num_steps = num_steps or self.num_sampling_steps
+        B = z_cond.size(0)
+        device, dtype = z_cond.device, z_cond.dtype
 
-        if cfg == 1.0:
-            x_0 = torch.randn(z.shape[0], self.in_channels).to(self.device)
-            self.rf.velocity_field = lambda x_t, t: self.net(x_t, t, z)
-        else:
-            print("Warning: cfg should not be used in toy")
-            x_0 = torch.randn(z.shape[0] // 2, self.in_channels).to(self.device)
-            x_0 = torch.cat([x_0, x_0], dim=0)
-            self.rf.velocity_field = lambda x_t, t, cfg: self.net.forward_with_cfg(x_t, t, z, cfg)
-    
-        sampler = EulerSampler(rectified_flow=self.rf)
-        sampler.sample_loop(num_steps=self.num_sampling_steps, x_0=x_0)
+        x0 = torch.randn(B, self.in_channels, device=device, dtype=dtype)
+
+        if cfg == 1.0:  # Turn off CFG
+            def vfunc(x_t, t):
+                return self.net(x_t, t, z_cond)
+        else:  # Turn on CFG
+            if self.null_token is not None:
+                z_uncond = self.null_token.expand(1, -1)  # (1, d)
+            else:
+                z_uncond = torch.zeros(1, z_cond.size(1), device=device, dtype=dtype)
+
+            if z_uncond.size(0) == 1:
+                z_u = z_uncond.expand(B, -1)
+            else:
+                assert z_uncond.size(0) == B, "CFG z_uncond batch size must be 1 or match z_cond"
+                z_u = z_uncond
+
+            def vfunc(x_t, t):
+                x_in = torch.cat([x_t, x_t], dim=0)
+                if t.ndim == 0:
+                    t_in = t.expand(2 * B)
+                elif t.size(0) == B:
+                    t_in = torch.cat([t, t], dim=0)
+                else:
+                    t_in = t  # 已经匹配
+                c_in = torch.cat([z_u, z_cond], dim=0)
+                v = self.net(x_in, t_in, c_in)  # (2B, C)
+                v_u, v_c = v.chunk(2, dim=0)
+                return v_u + cfg * (v_c - v_u)
+
+        # 绑定到推理用 RF
+        self.rf_infer.velocity_field = vfunc
+
+        sampler = EulerSampler(rectified_flow=self.rf_infer)
+        sampler.sample_loop(num_steps=num_steps, x_0=x0)
         x_1 = sampler.trajectories[-1]
-
-        self.rf.velocity_field = lambda x_t, t, z: self.net(x_t, t, z) # NOTE: reset to original velocity field, temporary bug
-        
         return x_1
 
 
@@ -116,7 +173,8 @@ class TimestepEmbedder(nn.Module):
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
-    def forward(self, t):
+    def forward(self, t, t_scale=1000.0):
+        t = t * t_scale
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
