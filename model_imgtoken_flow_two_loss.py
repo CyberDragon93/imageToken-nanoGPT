@@ -592,7 +592,19 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, image_bank=None, return_images=False, cfg=1.0):
+    def generate(
+        self,
+        idx,
+        max_new_tokens,
+        image_bank=None,
+        return_images=False,
+        cfg=1.0,
+        # —— 新增但全是可选，兼容旧调用 —— 
+        temperature: float | None = None,
+        top_k: int | None = None,
+        start_ids: torch.Tensor | None = None,
+        sample_mode: str = "rf",   # 'rf'（默认兼容旧逻辑）或 'ce'
+    ):
         import time, pathlib, torch
         from torchvision.utils import save_image, make_grid
 
@@ -615,8 +627,6 @@ class GPT(nn.Module):
             ref_param = next(self.transformer.parameters())
         device_ref, dtype_ref = ref_param.device, ref_param.dtype
 
-        id_seq = None
-
         bank_imgs = image_bank.to(device=device_ref, dtype=dtype_ref, non_blocking=True)  # [V,C,H,W]
         bank_flat = bank_imgs.flatten(1).to(dtype=torch.float32)                          # [V,P]
         bank_b2 = (bank_flat ** 2).sum(dim=1, keepdim=True).t() 
@@ -633,44 +643,75 @@ class GPT(nn.Module):
         P = C * H * W
         assert self.config.rf_target_channels == P, \
             f"rf_target_channels={self.config.rf_target_channels} != C*H*W={P}"
+        
+        id_seq = start_ids.to(device=img_seq.device, dtype=torch.long) if start_ids is not None else None  # [B, t]
+        def _top_k_logits(logits, k):
+            if k is None or k <= 0 or k >= logits.size(-1):
+                return logits
+            v, _ = torch.topk(logits, k)
+            cutoff = v[..., -1, None]
+            return torch.where(logits < cutoff, torch.full_like(logits, float('-inf')), logits)
 
-        steps = 200
-        for t_new in range(max_new_tokens):
-            img_cond = img_seq if img_seq.size(1) <= self.config.block_size else img_seq[:, -self.config.block_size:]
+        if sample_mode.lower() == "rf":
+            steps = 200
+            for t_new in range(max_new_tokens):
+                img_cond = img_seq if img_seq.size(1) <= self.config.block_size else img_seq[:, -self.config.block_size:]
 
-            x = self.forward_gpt_encoder(img_cond)  # [B,T,n_embd]
-            z_last = x[:, -1, :]                    # [B,n_embd]
-            z_last_rf = z_last.to(device=self.rf_loss_model.device, dtype=self.rf_loss_model.dtype, non_blocking=True)
+                x = self.forward_gpt_encoder(img_cond)  # [B,T,n_embd]
+                z_last = x[:, -1, :]                    # [B,n_embd]
+                z_last_rf = z_last.to(device=self.rf_loss_model.device, dtype=self.rf_loss_model.dtype, non_blocking=True)
 
-            new_flat = self.rf_loss_model.sample(z_last_rf, num_steps=steps, cfg=cfg)  # [B,P]
-            new_imgs = (
-                new_flat.view(B, C, H, W)
-                .to(device=img_seq.device, dtype=img_seq.dtype, non_blocking=True)
-                .clamp_(-1.0, 1.0)
-            )
+                new_flat = self.rf_loss_model.sample(z_last_rf, num_steps=steps, cfg=cfg)  # [B,P]
+                new_imgs = (
+                    new_flat.view(B, C, H, W)
+                    .to(device=img_seq.device, dtype=img_seq.dtype, non_blocking=True)
+                    .clamp_(-1.0, 1.0)
+                )
 
-            q = new_imgs.reshape(B, -1).to(dtype=torch.float32)     # [B,P]
-            a2 = (q ** 2).sum(dim=1, keepdim=True)                  # [B,1]
-            ab = q @ bank_flat.t()                                  # [B,V]
-            d2 = a2 + bank_b2 - 2.0 * ab                            # [B,V]
-            nn_id = torch.argmin(d2, dim=1, keepdim=True)           # [B,1], dtype=long
+                q = new_imgs.reshape(B, -1).to(dtype=torch.float32)     # [B,P]
+                a2 = (q ** 2).sum(dim=1, keepdim=True)                  # [B,1]
+                ab = q @ bank_flat.t()                                  # [B,V]
+                d2 = a2 + bank_b2 - 2.0 * ab                            # [B,V]
+                nn_id = torch.argmin(d2, dim=1, keepdim=True)           # [B,1], dtype=long
 
-            id_seq = nn_id if id_seq is None else torch.cat([id_seq, nn_id], dim=1)
+                id_seq = nn_id if id_seq is None else torch.cat([id_seq, nn_id], dim=1)
 
-            # --- 保存成对对比图（相同前缀） ---
-            # 单图：bXX_tYYY_gen.png & bXX_tYYY_nn.png
-            gen01 = _to01(new_imgs.detach().cpu())
-            nn_imgs = bank_imgs[nn_id.squeeze(1)].to(device="cpu", non_blocking=True)  # [B,C,H,W]
-            nn01 = _to01(nn_imgs)
+                # --- 保存成对对比图（相同前缀） ---
+                # 单图：bXX_tYYY_gen.png & bXX_tYYY_nn.png
+                gen01 = _to01(new_imgs.detach().cpu())
+                nn_imgs = bank_imgs[nn_id.squeeze(1)].to(device="cpu", non_blocking=True)  # [B,C,H,W]
+                nn01 = _to01(nn_imgs)
 
-            for b in range(B):
-                prefix = base / f"b{b:02d}_t{t_new:03d}"
-                save_image(gen01[b], str(prefix) + "_gen.png")
-                save_image(nn01[b], str(prefix) + "_nn.png")
+                for b in range(B):
+                    prefix = base / f"b{b:02d}_t{t_new:03d}"
+                    save_image(gen01[b], str(prefix) + "_gen.png")
+                    save_image(nn01[b], str(prefix) + "_nn.png")
 
-            # --- 用最近邻作为下一 token 的“图片输入” ---
-            next_imgs = bank_imgs[nn_id.squeeze(1)].to(device=img_seq.device, dtype=img_seq.dtype, non_blocking=True)
-            img_seq = torch.cat([img_seq, next_imgs.unsqueeze(1)], dim=1)
+                # --- 用最近邻作为下一 token 的“图片输入” ---
+                next_imgs = bank_imgs[nn_id.squeeze(1)].to(device=img_seq.device, dtype=img_seq.dtype, non_blocking=True)
+                img_seq = torch.cat([img_seq, next_imgs.unsqueeze(1)], dim=1)
+        elif sample_mode.lower() == "ce":
+            if not self.config.use_ce_loss:
+                raise ValueError("sample_mode='ce' but model is not configured to use CE loss.")
+            for t_new in range(max_new_tokens):
+                img_cond = img_seq if img_seq.size(1) <= self.config.block_size else img_seq[:, -self.config.block_size:]
+                x = self.forward_gpt_encoder(img_cond)              # [B,T,n_embd]
+                logits = self.lm_head(x[:, -1:, :])                 # [B,1,V]
+                logits = logits[:, -1, :]                           # [B,V]
+                if temperature is not None and temperature > 0:
+                    logits = logits / float(temperature)
+                logits = _top_k_logits(logits, top_k)
+
+                probs = torch.softmax(logits, dim=-1)               # [B,V]
+                next_ids = torch.multinomial(probs, num_samples=1)  # [B,1], long
+
+                id_seq = next_ids if id_seq is None else torch.cat([id_seq, next_ids], dim=1)
+
+                # 用采样出的 id 从 image_bank 取出图像，作为下一 token 的图像输入
+                next_imgs = bank_imgs[next_ids.squeeze(1)].to(device=img_seq.device, dtype=img_seq.dtype, non_blocking=True)
+                img_seq = torch.cat([img_seq, next_imgs.unsqueeze(1)], dim=1)
+        else:
+            raise ValueError(f"Unknown sample_mode: {sample_mode}. Use 'rf' or 'ce'.")
 
         if return_images:
         # 返回的是“驱动过的序列”（其中后续 token 已被替换为 NN）
