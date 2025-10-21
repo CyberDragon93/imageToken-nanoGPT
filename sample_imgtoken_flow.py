@@ -11,7 +11,7 @@ import tiktoken
 from PIL import Image
 from torchvision import transforms
 
-from model_imgtoken import GPTConfig, GPT
+from model_imgtoken_flow import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 init_from = 'resume'  # 'resume' or a gpt2 variant (e.g. 'gpt2-xl')
@@ -103,6 +103,8 @@ if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
 
+start = "秋高气爽时，苹果采摘季。伴着美好的“丰”景和醇厚的果香，记者来到陕西延安，"
+
 # ------------------------- vision or text path -------------------------
 use_vision = getattr(model.config, 'use_vision_encoder', False)
 
@@ -133,27 +135,29 @@ if use_vision:
         start_ids_list = [0]
 
     start_ids = torch.tensor(start_ids_list, dtype=torch.long, device=device)[None, ...]  # [1, T0]
-    x0 = image_bank[start_ids[0].to('cpu')].unsqueeze(0)  # [1, T0, 1, H, W]
+    x0 = image_bank[start_ids.to('cpu')]  # [1, T0, 1, H, W]
+    # e([1, 11, 1, 32, 32])
+    print(f"start_ids_list: {start_ids_list}, x0.shape: {x0.shape}")
 
     with torch.no_grad(), ctx:
         for k in range(num_samples):
+            # idx, max_new_tokens, image_bank=None, return_images=False, cfg=1.0
             y_ids = model.generate(
                 x0.clone().to(device),
                 max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                image_bank=image_bank,           # [V, 1, H, W] (on CPU is fine)
-                start_ids=start_ids.clone().to(device)  # [1, T0]
+                image_bank=image_bank,   # [V, 1, H, W] (on CPU is fine)
             )
             print(decode(y_ids[0].tolist()))
+            print(y_ids.shape)
             print('---------------')
 
 else:
+    raise ValueError("GPT model without RF loss or Vision Encoder is not supported here.")
     # ===== Pure text generation (original path) =====
-    start_ids_list = encode(start)
-    x = torch.tensor(start_ids_list, dtype=torch.long, device=device)[None, ...]
-    with torch.no_grad(), ctx:
-        for k in range(num_samples):
-            y = model.generate(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+    # start_ids_list = encode(start)
+    # x = torch.tensor(start_ids_list, dtype=torch.long, device=device)[None, ...]
+    # with torch.no_grad(), ctx:
+    #     for k in range(num_samples):
+    #         y = model.generate(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
+    #         print(decode(y[0].tolist()))
+    #         print('---------------')

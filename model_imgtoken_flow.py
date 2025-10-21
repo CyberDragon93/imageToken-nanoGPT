@@ -323,18 +323,12 @@ class GPT(nn.Module):
 
         modules.update(dict(
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            flow_pe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.transformer = nn.ModuleDict(modules)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        if not config.use_vision_encoder:
-            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -409,6 +403,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)  # (b, t, n_embd), the condition z for RF
+
+        flow_pe = self.transformer.flow_pe(pos) # (t, n_embd)
+        x = x + flow_pe
         return x
 
     def forward(self, idx, targets=None):
@@ -540,7 +537,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, image_bank=None, return_images=False, cfg=1.0):
+    def generate(self, idx, max_new_tokens, image_bank=None, return_images=False, cfg=4.0):
         import time, pathlib, torch
         from torchvision.utils import save_image, make_grid
 
@@ -548,7 +545,7 @@ class GPT(nn.Module):
             return (x.clamp(-1, 1) + 1) * 0.5
 
         time_str = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
-        save_dir = f"/scratch/10992/liaorunlong93/logs/nanoGPT_CHN_3G/chinese-image-flowhead-sample{time_str}"
+        save_dir = f"/scratch/10992/liaorunlong93/logs/samples/chinese-image-flowhead-sample{time_str}"
         base = pathlib.Path(save_dir)
         (base / "by_step").mkdir(parents=True, exist_ok=True)
 
@@ -584,9 +581,11 @@ class GPT(nn.Module):
 
         steps = 200
         for t_new in range(max_new_tokens):
+            print(f"seq length: {img_seq.size(1)} -> {img_seq.size(1)+1}")
             img_cond = img_seq if img_seq.size(1) <= self.config.block_size else img_seq[:, -self.config.block_size:]
 
             x = self.forward_gpt_encoder(img_cond)  # [B,T,n_embd]
+            print(f"feature shape: {tuple(x.shape)}")
             z_last = x[:, -1, :]                    # [B,n_embd]
             z_last_rf = z_last.to(device=self.rf_loss_model.device, dtype=self.rf_loss_model.dtype, non_blocking=True)
 
@@ -621,9 +620,7 @@ class GPT(nn.Module):
             img_seq = torch.cat([img_seq, next_imgs.unsqueeze(1)], dim=1)
 
         if return_images:
-        # 返回的是“驱动过的序列”（其中后续 token 已被替换为 NN）
             return img_seq
         else:
-            # 返回 id 轨迹（每步最邻近的 bank 索引）
             return id_seq
 
