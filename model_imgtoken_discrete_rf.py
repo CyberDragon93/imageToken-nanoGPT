@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from pyexpat import model
 
 import torch
 import torch.nn as nn
@@ -65,6 +66,7 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # Causal mask
             # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -507,7 +509,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, image_bank=None, start_ids=None):
+    def generate(self, batch_size, image_bank=None):
         """
         Two modes of generation:
         - text mode (use_vision_encoder=False): idx is LongTensor [B, T], returns [B, T+max_new_tokens]
@@ -520,56 +522,22 @@ class GPT(nn.Module):
           - text mode: LongTensor [B, T+max_new_tokens]
           - vision mode: LongTensor [B, T_ids + max_new_tokens]
         """
-        if self.config.use_vision_encoder:
-            assert idx.dim() == 5, f"Vision generate expects (B,T,C,H,W), got {tuple(idx.shape)}"
-            assert image_bank is not None, "image_bank (id->image table) is required when use_vision_encoder=True"
+        B = batch_size
+        C = self.config.in_channels
+        H = self.config.image_size
+        W = self.config.image_size
+        T = self.config.block_size
 
-            # weight = self.transformer.vte.patch[0].weight
-            weight = self.transformer.vte.mlp[0].weight
-            img_seq = idx.to(device=weight.device, dtype=weight.dtype)  # [B, T0, C, H, W]
-            B, T0, C, H, W = img_seq.shape
+        image_bank = image_bank.to(device=torch.device('cuda'), dtype=torch.float32)
 
-            if start_ids is not None:
-                assert start_ids.dim() == 2 and start_ids.shape[0] == B and start_ids.shape[1] == T0, \
-                    f"start_ids must be [B,T0]; got {tuple(start_ids.shape)} vs {[B,T0]}"
-                id_seq = start_ids.to(device=weight.device)
-            else:
-                id_seq = torch.empty((B, 0), dtype=torch.long, device=weight.device)
+        euler_steps = 100
+        time_grid = torch.linspace(0, 1, steps=euler_steps)
+        lr = 1.0 / euler_steps     
+        xt = torch.randn((B, T, C, H, W), device=torch.device('cuda'))
+        for t in time_grid:
+            p_t = torch.softmax(self(xt)[0],dim=-1)
+            # image_bank: [V, C, H, W], p_t: [B, T, V]
+            x_1_hat =  torch.einsum('btv, vchw -> btchw',p_t,image_bank)
+            xt = xt + lr * (x_1_hat - xt) / (1 - t)
 
-            for _ in range(max_new_tokens):
-                # crop to the last block_size tokens for efficiency
-                img_cond = img_seq if img_seq.size(1) <= self.config.block_size else img_seq[:, -self.config.block_size:]
-
-                # forward the model to get the logits for the next token
-                logits, _ = self(img_cond)             # [B, 1, V]
-                logits = logits[:, -1, :] / temperature
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
-
-                # sample from the distribution or take the most likely
-                next_id = torch.multinomial(probs, num_samples=1)  # [B, 1]
-                id_seq = torch.cat((id_seq, next_id), dim=1)
-
-                # convert to image and append to the image sequence
-                ids_cpu = next_id.squeeze(1).to('cpu') if image_bank.device.type == 'cpu' else next_id.squeeze(1)
-                next_imgs = image_bank[ids_cpu]                    # [B, C, H, W]
-                next_imgs = next_imgs.to(device=img_seq.device, dtype=img_seq.dtype).unsqueeze(1)  # [B,1,C,H,W]
-                img_seq = torch.cat((img_seq, next_imgs), dim=1)
-
-            return id_seq
-
-        else:
-            # --- Original ---
-            for _ in range(max_new_tokens):
-                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-                logits, _ = self(idx_cond)
-                logits = logits[:, -1, :] / temperature
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat((idx, idx_next), dim=1)
-            return idx
+        return xt 

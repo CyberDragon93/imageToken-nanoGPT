@@ -38,7 +38,7 @@ from torchvision import transforms
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from model_imgtoken import GPTConfig, GPT
+from model_imgtoken_discrete_rf import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -57,7 +57,7 @@ wandb_project = 'nanoGPT_CHN_3G'
 wandb_run_name = 'chinese_3G_img_tokenizer_qiang' # 'run' + str(time.time())
 # data
 dataset = 'chinese_char'
-batch_size = 256 # micro-batch size per *optimizer step loop*, before GAS
+batch_size = 512 # micro-batch size per *optimizer step loop*, before GAS
 gradient_accumulation_steps = 1  # intended global GAS; will be adjusted by world_size below
 eval_interval = 1000
 block_size = 128
@@ -194,10 +194,7 @@ def get_batch(split):
     
     if image_dataset is not None:
         x_1 = image_dataset[x_ids]
-        noise = torch.randn_like(x_1)
-        t = torch.rand(noise.shape[0], device=noise.device)
-        x_t = t[:, None, None, None, None] * x_1 + (1. - t[:, None, None, None, None]) * noise
-        x = x_t.detach()
+        x = x_1
         y = y_ids
     else:
         # Otherwise, retain the original behavior (use IDs as data)
@@ -380,7 +377,12 @@ while True:
         for micro_step in range(eff_gas):
             X, Y = get_batch('train')
             with accelerator.autocast():
-                logits, loss = model(X, Y)
+                noise = torch.randn_like(X)
+                t = torch.rand(noise.shape[0], device=noise.device)
+                t = t.view(-1, 1, 1, 1, 1)
+                x_t = t * X + (1. - t) * noise
+                logits, loss = model(x_t, Y)
+
             total_micro_loss += loss.item()
             loss = loss / eff_gas
             accelerator.backward(loss)
