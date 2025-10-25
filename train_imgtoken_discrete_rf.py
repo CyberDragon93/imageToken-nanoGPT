@@ -59,7 +59,7 @@ wandb_run_name = 'chinese_3G_img_tokenizer_qiang' # 'run' + str(time.time())
 dataset = 'chinese_char'
 batch_size = 512 # micro-batch size per *optimizer step loop*, before GAS
 gradient_accumulation_steps = 1  # intended global GAS; will be adjusted by world_size below
-eval_interval = 1000
+eval_interval = 3000
 block_size = 128
 # model
 n_layer = 12
@@ -375,12 +375,12 @@ while True:
     total_micro_loss = 0.0
     with accelerator.accumulate(model):
         for micro_step in range(eff_gas):
-            X, Y = get_batch('train')
+            X_clean, Y = get_batch('train')
             with accelerator.autocast():
-                noise = torch.randn_like(X)
-                t = torch.rand(noise.shape[0], device=noise.device)
-                t = t.view(-1, 1, 1, 1, 1)
-                x_t = t * X + (1. - t) * noise
+                noise = torch.randn_like(X_clean)
+                t = torch.rand((noise.shape[0], noise.shape[1]), device=noise.device)
+                t = t[:, :, None, None, None]
+                x_t = t * X_clean + (1. - t) * noise
                 logits, loss = model(x_t, Y)
 
             total_micro_loss += loss.item()

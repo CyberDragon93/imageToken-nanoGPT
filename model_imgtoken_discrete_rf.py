@@ -62,7 +62,7 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -387,13 +387,13 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        if (targets is not None) or self.config.use_vision_encoder:
+            logits = self.lm_head(x)  # [B, T, V]
+            loss = None if targets is None else F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            )
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x)
             loss = None
 
         return logits, loss
@@ -509,35 +509,130 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, batch_size, image_bank=None):
+    def generate(
+        self,
+        batch_size,
+        image_bank=None,
+        N_steps: int = 50,
+        t_mode: str = "async",     # "sync" / "async" / "sde" / "sde-async"
+        top_k: int | None = None,
+        verbose: bool = True,
+        # === 新增：prompt 注入相关 ===
+        prompt_ids: torch.Tensor | None = None,  # 长度为 n_prompt 的索引；可为 [n_prompt] 或 [B, n_prompt]
+        freeze_prompt: bool = True,              # 若 True，则采样过程中始终不更新前 n_prompt 个 token
+    ):
         """
-        Two modes of generation:
-        - text mode (use_vision_encoder=False): idx is LongTensor [B, T], returns [B, T+max_new_tokens]
-        - vision-conditioned mode (use_vision_encoder=True):
-            * idx is Float/BFloat16 Tensor of images [B, T0, C, H, W]
-            * requires image_bank: Tensor [V, C, H, W] (id->image lookup table)
-            * optional start_ids: LongTensor [B, T0], the starting ids corresponding to idx;
-              if provided, the returned ids will include them
-        Returns:
-          - text mode: LongTensor [B, T+max_new_tokens]
-          - vision mode: LongTensor [B, T_ids + max_new_tokens]
+        Args (仅列出和本改动相关的关键点):
+            image_bank: [V, C, H, W]
+            prompt_ids: 1D [n_prompt]（对 batch 复用）或 2D [B, n_prompt]（逐样本不同）
+            freeze_prompt: 是否在采样循环中跳过对前 n_prompt 的更新
         """
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         B = batch_size
         C = self.config.in_channels
         H = self.config.image_size
         W = self.config.image_size
         T = self.config.block_size
 
-        image_bank = image_bank.to(device=torch.device('cuda'), dtype=torch.float32)
+        assert image_bank is not None, "image_bank is required for vision-conditioned generation."
+        image_bank = image_bank.to(device=device, dtype=torch.float32)  # [V, C, H, W]
 
-        euler_steps = 100
-        time_grid = torch.linspace(0, 1, steps=euler_steps)
-        lr = 1.0 / euler_steps     
-        xt = torch.randn((B, T, C, H, W), device=torch.device('cuda'))
-        for t in time_grid:
-            p_t = torch.softmax(self(xt)[0],dim=-1)
-            # image_bank: [V, C, H, W], p_t: [B, T, V]
-            x_1_hat =  torch.einsum('btv, vchw -> btchw',p_t,image_bank)
-            xt = xt + lr * (x_1_hat - xt) / (1 - t)
+        # 初始化为高斯
+        x_t = torch.randn((B, T, C, H, W), device=device, dtype=torch.float32)
 
-        return xt 
+        # -------- 新增：将前 n_prompt 个 token 用 image_bank 中指定索引的图像注入 ----------
+        n_prompt = 0
+        if prompt_ids is not None:
+            # 允许 [n_prompt] 或 [B, n_prompt]
+            prompt_ids = prompt_ids.to(device='cpu', dtype=torch.long)
+            if prompt_ids.dim() == 1:
+                prompt_ids = prompt_ids.unsqueeze(0).expand(B, -1).contiguous()  # [B, n_prompt]
+            elif prompt_ids.dim() == 2:
+                assert prompt_ids.size(0) == B, f"prompt_ids first dim must be batch_size={B}"
+            else:
+                raise ValueError("prompt_ids must be 1D or 2D")
+
+            n_prompt = prompt_ids.size(1)
+            if n_prompt > T:
+                raise ValueError(f"n_prompt={n_prompt} exceeds block_size T={T}")
+            # 从 image_bank 取出对应图像并写入到前 n_prompt 个 token
+            prompt_imgs = image_bank[prompt_ids]  # [B, n_prompt, C, H, W]
+            x_t[:, :n_prompt] = prompt_imgs.to(x_t.device, x_t.dtype)
+        # ----------------------------------------------------------------------
+
+        def softmax_topk(logits: torch.Tensor, k: int | None, dim: int = -1) -> torch.Tensor:
+            if (k is None) or (k <= 0) or (k >= logits.size(dim)):
+                return torch.softmax(logits, dim=dim)
+            topk_vals, topk_idx = torch.topk(logits, k, dim=dim)
+            mask = torch.zeros_like(logits, dtype=torch.bool).scatter(dim, topk_idx, True)
+            masked_logits = logits.masked_fill(~mask, float('-inf'))
+            return torch.softmax(masked_logits, dim=dim)
+
+        mode = t_mode.lower()
+
+        if mode == "sync":
+            # 同步 ODE
+            for i in range(N_steps):
+                t = i / N_steps  # in [0,1)
+                if verbose:
+                    print(f"[sync] step {i+1}/{N_steps}, t={t:.5f}")
+                logits, _ = self(x_t)                 # [B, T, V]
+                p_t = softmax_topk(logits, top_k, -1) # [B, T, V]
+                x_1_hat = torch.einsum('btv, vchw -> btchw', p_t, image_bank)  # [B, T, C, H, W]
+                delta = (x_1_hat - x_t) / (1.0 - t) / N_steps
+                if freeze_prompt and n_prompt > 0:
+                    delta[:, :n_prompt] = 0
+                x_t = x_t + delta
+
+        elif mode in ("async", "ar"):
+            # 逐 token ODE（自回归式推进）
+            start_j = n_prompt if freeze_prompt else 0
+            for j in range(start_j, T):
+                for i in range(N_steps):
+                    t = i / N_steps
+                    if verbose:
+                        print(f"[async] token {j+1}/{T}, step {i+1}/{N_steps}, t={t:.5f}")
+                    logits, _ = self(x_t)          # [B, T, V]
+                    logits_j = logits[:, j, :]     # [B, V]
+                    p_t_j = softmax_topk(logits_j, top_k, -1)        # [B, V]
+                    x1_hat_j = torch.einsum('bv, vchw -> bchw', p_t_j, image_bank)  # [B, C, H, W]
+                    xj = x_t[:, j, :, :, :]
+                    xj = xj + (x1_hat_j - xj) / (1.0 - t) / N_steps
+                    x_t[:, j, :, :, :] = xj
+
+        elif mode in ("sde", "diffusion", "sde-sync"):
+            # 同步 SDE
+            for i in range(N_steps):
+                t_next = (i + 1) / N_steps
+                if verbose:
+                    print(f"[sde] step {i+1}/{N_steps}, t_next={t_next:.5f}")
+                logits, _ = self(x_t)                 # [B, T, V]
+                p_t = softmax_topk(logits, top_k, -1) # [B, T, V]
+                x_1_hat = torch.einsum('btv, vchw -> btchw', p_t, image_bank)  # [B, T, C, H, W]
+                eps = torch.randn_like(x_t)
+                x_next = t_next * x_1_hat + (1.0 - t_next) * eps
+                if freeze_prompt and n_prompt > 0:
+                    x_next[:, :n_prompt] = x_t[:, :n_prompt]  # 保持前 n_prompt 不变
+                x_t = x_next
+
+        elif mode in ("sde-async", "sde_ar", "sde-ar"):
+            # 逐 token SDE（自回归式推进）
+            start_j = n_prompt if freeze_prompt else 0
+            for j in range(start_j, T):
+                for i in range(N_steps):
+                    t_next = (i + 1) / N_steps
+                    if verbose:
+                        print(f"[sde-async] token {j+1}/{T}, step {i+1}/{N_steps}, t_next={t_next:.5f}")
+                    logits, _ = self(x_t)          # [B, T, V]
+                    logits_j = logits[:, j, :]     # [B, V]
+                    p_t_j = softmax_topk(logits_j, top_k, -1)                      # [B, V]
+                    x1_hat_j = torch.einsum('bv, vchw -> bchw', p_t_j, image_bank)  # [B, C, H, W]
+                    eps_j = torch.randn_like(x_t[:, j, :, :, :])
+                    x_t[:, j, :, :, :] = t_next * x1_hat_j + (1.0 - t_next) * eps_j
+
+        else:
+            raise ValueError(f"Unknown t_mode='{t_mode}', expected 'sync', 'async', 'sde', or 'sde-async'.")
+
+        return x_t
+

@@ -1,6 +1,7 @@
 """
 Sample from a trained model (image->text autoregressive)
 """
+import math
 import os
 import glob
 import pickle
@@ -16,8 +17,8 @@ from model_imgtoken_discrete_rf import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 init_from = 'resume'  # 'resume' or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out'       # ignored if init_from is not 'resume'
-start = "\n"          # or "FILE:prompt.txt"
-num_samples = 10
+start = "今天天气很好"          # or "FILE:prompt.txt"
+num_samples = 3
 max_new_tokens = 500
 temperature = 0.8
 top_k = 200
@@ -132,31 +133,44 @@ if use_vision:
     else:
         start_ids_list = [0]
 
-    start_ids = torch.tensor(start_ids_list, dtype=torch.long, device=device)[None, ...]  # [1, T0]
-    x0 = image_bank[start_ids[0].to('cpu')].unsqueeze(0)  # [1, T0, 1, H, W]
+    start_ids = torch.tensor(start_ids_list, dtype=torch.long, device=device)  # [1, T0]
 
     with torch.no_grad(), ctx:
-        num_samples = 1
-        for k in range(num_samples):
-            y_imgs = model.generate( # [B, T, 1, H, W]
-                batch_size = 10,
-                image_bank=image_bank 
-            )
-            # Process generated images
-            for i in range(1):
-                gen_imgs = y_imgs[i]  # [T, 1, H, W]
-                for t in range(gen_imgs.shape[0]):
-                    img_tensor = gen_imgs[t]  # [1, H, W]
-                    img = transforms.ToPILImage()(img_tensor.cpu())
-                    img.save(f'generated_sample_{k}_img_{i}_step_{t}.png')
-            print(f"Sample {k+1} generated and saved.")
+        y_imgs = model.generate( # [B, T, 1, H, W]
+            batch_size = num_samples,
+            image_bank = image_bank,
+            top_k = None,
+            prompt_ids = start_ids,   # <<< 新增
+            freeze_prompt = True,  
+        )
+        # Process generated images
+        save_dir = out_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+        for i in range(num_samples):  
+            gen_imgs = y_imgs[i]  # [T, C, H, W] 或 [T, 1, H, W]
+            T = gen_imgs.shape[0]
+
+            pil_list = []
+            for t in range(T):
+                img_tensor = gen_imgs[t]  # [C, H, W] 或 [1, H, W]
+                pil_img = transforms.ToPILImage()(img_tensor.cpu())
+                pil_list.append(pil_img)
+
+            cols = min(10, T)
+            rows = math.ceil(T / 10)
+
+            W, H = pil_list[0].size
+            mode = pil_list[0].mode
+            grid = Image.new(mode, (cols * W, rows * H))  # 无边距
+
+            for idx, pil_img in enumerate(pil_list):
+                r, c = divmod(idx, 10)
+                grid.paste(pil_img, (c * W, r * H))
+
+            grid_path = os.path.join(save_dir, f'generated_sample_{i}_grid.png')
+            grid.save(grid_path)
+            print(f"Sample {i} generated and saved to {grid_path}.")
 
 else:
-    # ===== Pure text generation (original path) =====
-    start_ids_list = encode(start)
-    x = torch.tensor(start_ids_list, dtype=torch.long, device=device)[None, ...]
-    with torch.no_grad(), ctx:
-        for k in range(num_samples):
-            y = model.generate(x.clone(), max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+    raise NotImplementedError("This script only supports vision-conditioned generation.")
